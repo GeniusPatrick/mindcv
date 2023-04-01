@@ -1,6 +1,9 @@
 """ Model training pipeline """
 import logging
 import os
+import socket
+
+import wandb
 
 import mindspore as ms
 from mindspore import Tensor
@@ -11,17 +14,11 @@ from mindcv.loss import create_loss
 from mindcv.models import create_model
 from mindcv.optim import create_optimizer
 from mindcv.scheduler import create_scheduler
-from mindcv.utils import AllReduceSum, StateMonitor, create_trainer, get_metrics, set_seed
+from mindcv.utils import AllReduceSum, StateMonitor, create_trainer, get_metrics, set_seed, setup_logger
 
 from config import parse_args  # isort: skip
 
-# TODO: arg parser already has a logger
-logger = logging.getLogger("train")
-logger.setLevel(logging.INFO)
-h1 = logging.StreamHandler()
-formatter1 = logging.Formatter("%(message)s")
-logger.addHandler(h1)
-h1.setFormatter(formatter1)
+logger = logging.getLogger(__name__)
 
 
 def train(args):
@@ -43,6 +40,7 @@ def train(args):
         rank_id = None
 
     set_seed(args.seed)
+    setup_logger(output_dir=args.ckpt_save_dir, rank=rank_id)
 
     # create dataset
     dataset_train = create_dataset(
@@ -240,24 +238,57 @@ def train(args):
     assert (
         args.ckpt_save_policy != "top_k" or args.val_while_train is True
     ), "ckpt_save_policy is top_k, val_while_train must be True."
+
+    def get_host_ip():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+
+    essential_cfgs = {
+        "bs": args.batch_size,
+        "aa": args.auto_augment,
+        "mixup": args.mixup,
+        "cutmix": args.cutmix,
+        "model": args.model,
+        "epochs": args.epoch_size,
+        "scheduler": args.scheduler,
+        "lr": args.lr,
+        "opt": args.opt,
+        "momentum": args.momentum,
+        "wd": args.weight_decay,
+        "amp": args.amp_level,
+        "loss_scale": f"{args.loss_scale}({args.loss_scale_type})",
+    }
+    if rank_id in [None, 0]:
+        logger.info("W&B initialing...")
+        wandb.init(
+            project="mindcv-gpu",
+            name=f"{args.model}/baseline",
+            group=f"{args.model}",
+            tags=["baseline", f"{get_host_ip()}"],
+            config=essential_cfgs,
+        )
+        logger.info("W&B initialed.")
+        wandb.save(args.config)
     state_cb = StateMonitor(
         trainer,
-        summary_dir=summary_dir,
+        model_name=args.model,
+        ema=args.ema,
+        last_epoch=begin_epoch,
+        dataset_sink_mode=args.dataset_sink_mode,
         dataset_val=loader_eval,
-        val_interval=args.val_interval,
         metric_name=list(metrics.keys()),
+        val_interval=args.val_interval,
         ckpt_dir=args.ckpt_save_dir,
         ckpt_save_interval=args.ckpt_save_interval,
-        best_ckpt_name=args.model + "_best.ckpt",
-        rank_id=rank_id,
-        device_num=device_num,
+        ckpt_save_policy=args.ckpt_save_policy,
         log_interval=args.log_interval,
         keep_checkpoint_max=args.keep_checkpoint_max,
-        model_name=args.model,
-        last_epoch=begin_epoch,
-        ckpt_save_policy=args.ckpt_save_policy,
-        ema=args.ema,
-        dataset_sink_mode=args.dataset_sink_mode,
+        summary_dir=summary_dir,
+        rank_id=rank_id,
+        device_num=device_num,
     )
 
     callbacks = [state_cb]
@@ -291,6 +322,8 @@ def train(args):
             logger.info("Start training")
 
     trainer.train(args.epoch_size, loader_train, callbacks=callbacks, dataset_sink_mode=args.dataset_sink_mode)
+    if rank_id in [None, 0]:
+        wandb.finish()
 
 
 if __name__ == "__main__":

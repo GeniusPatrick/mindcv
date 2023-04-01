@@ -1,11 +1,13 @@
 """checkpoint manager """
+import logging
 import os
 import stat
 
 import numpy as np
 
 import mindspore as ms
-from mindspore import log as logger
+
+_logger = logging.getLogger(__name__)
 
 
 class CheckpointManager:
@@ -48,9 +50,9 @@ class CheckpointManager:
             os.chmod(file_name, stat.S_IWRITE)
             os.remove(file_name)
         except OSError:
-            logger.warning("OSError, failed to remove the older ckpt file %s.", file_name)
+            _logger.warning("OSError, failed to remove the older ckpt file %s.", file_name)
         except ValueError:
-            logger.warning("ValueError, failed to remove the older ckpt file %s.", file_name)
+            _logger.warning("ValueError, failed to remove the older ckpt file %s.", file_name)
 
     def remove_oldest_ckpoint_file(self):
         """Remove the oldest checkpoint file from this checkpoint manager and also from the directory."""
@@ -106,13 +108,17 @@ class CheckpointManager:
         """Save checkpoint according to different save strategy."""
         if self.ckpt_save_policy is None:
             ms.save_checkpoint(network, save_path, async_save=True)
+            _logger.info(f"Saving model to {save_path}")
         elif self.ckpt_save_policy == "top_k":
             if metric is None:
                 raise ValueError(f"The expected 'metric' is not None, but got: {metric}.")
             self.top_K_checkpoint(network, K=num_ckpt, metric=metric, save_path=save_path)
+            _logger.info("Top K accuracy checkpoints:")
+            _logger.info("\n".join(ckpt + "\t" + str(acc) for ckpt, acc in self._ckpoint_filelist))
             return self._ckpoint_filelist
         elif self.ckpt_save_policy == "latest_k":
             self.latest_K_checkpoint(network, K=num_ckpt, save_path=save_path)
+            _logger.info(f"Saving model to {save_path}")
             return self._ckpoint_filelist
         else:
             raise ValueError(
