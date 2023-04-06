@@ -193,6 +193,9 @@ class StateMonitor(Callback):
                 self.best_res = res[0]
                 self.best_epoch = cur_epoch
                 _logger.info(f"=> New best val acc: {res[0]:.4%}")
+                if self.rank_id in [0, None]:
+                    wandb.run.summary["best_acc"] = self.best_res
+                    wandb.run.summary["best_epoch"] = self.best_epoch
                 if self.save_best_ckpt and self.rank_id in [0, None]:
                     save_checkpoint(cb_params.train_network, self.best_ckpt_path, async_save=True)
 
