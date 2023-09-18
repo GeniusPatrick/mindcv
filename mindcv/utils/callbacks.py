@@ -91,7 +91,7 @@ class StateMonitor(Callback):
         # model_ema
         if self.model_ema:
             self.hyper_map = ops.HyperMap()
-            self.online_params = ParameterTuple(self.model.train_network.get_parameters())
+            self.online_params = ParameterTuple(self.model.train_network.network.get_parameters())
             self.swap_params = self.online_params.clone("swap", "zeros")
 
     def __enter__(self):
@@ -104,14 +104,13 @@ class StateMonitor(Callback):
     def apply_eval(self, run_context):
         """Model evaluation, return validation accuracy."""
         if self.model_ema:
-            cb_params = run_context.original_args()
             self.hyper_map(ops.assign, self.swap_params, self.online_params)
-            ema_dict = dict()
-            net = self._get_network_from_cbp(cb_params)
-            for param in net.get_parameters():
-                if param.name.startswith("ema"):
-                    new_name = param.name.split("ema.")[1]
-                    ema_dict[new_name] = param.data
+            ema_prefix = "ema."
+            ema_dict = {
+                param.name[len(ema_prefix) :]: param.data
+                for param in self.model.train_network.get_parameters()
+                if param.name.startswith(ema_prefix)
+            }
             load_param_into_net(self.model.train_network.network, ema_dict)
             res_dict = self.model.eval(self.dataset_val, dataset_sink_mode=False)
             self.hyper_map(ops.assign, self.online_params, self.swap_params)
