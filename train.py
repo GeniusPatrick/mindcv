@@ -14,6 +14,7 @@ from mindcv.scheduler import create_scheduler
 from mindcv.utils import (
     AllReduceSum,
     StateMonitor,
+    ProgressBarCallback,
     create_trainer,
     get_metrics,
     require_customized_train_step,
@@ -45,7 +46,8 @@ def train(args):
         rank_id = None
 
     set_seed(args.seed)
-    set_logger(name="mindcv", output_dir=args.ckpt_save_dir, rank=rank_id, color=False)
+    os.environ["COLUMNS"] = "200"  # mpirun set terminal width to zero
+    set_logger(name="mindcv", output_dir=args.ckpt_save_dir, rank=0 if rank_id is None else rank_id, color=True)
     logger.info(
         "We recommend installing `termcolor` via `pip install termcolor` "
         "and setup logger by `set_logger(..., color=True)`"
@@ -286,6 +288,8 @@ def train(args):
     )
 
     callbacks = [state_cb]
+    if rank_id == 0 or rank_id is None:
+        callbacks.append(ProgressBarCallback(args.epoch_size))
     essential_cfg_msg = "\n".join(
         [
             "Essential Experiment Configurations:",

@@ -14,6 +14,7 @@ from .reduce_manager import AllReduceSum
 
 __all__ = [
     "StateMonitor",
+    "ProgressBarCallback",
     "ValCallback",
 ]
 
@@ -324,6 +325,48 @@ class StateMonitor(Callback):
                 Tensor(param).flush_from_cache()
         if not has_cache_params:
             self._need_flush_from_cache = False
+
+
+class ProgressBarCallback(Callback):
+    def __init__(self, n_epochs):
+        super().__init__()
+        self.n_epochs = n_epochs
+
+    def __enter__(self):
+        from rich.progress import (
+            BarColumn,
+            Progress,
+            MofNCompleteColumn,
+            SpinnerColumn,
+            TaskProgressColumn,
+            TextColumn,
+            TimeElapsedColumn,
+            TimeRemainingColumn,
+        )
+        self.progress = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=None),
+            SpinnerColumn(),
+            TaskProgressColumn(),
+            "•",
+            MofNCompleteColumn(),
+            "•",
+            TimeElapsedColumn(),
+            "•",
+            TimeRemainingColumn(),
+        )
+        self.progress.start()
+        self.task = self.progress.add_task("Training", total=self.n_epochs)
+        return self
+
+    def __exit__(self, *exc_args):
+        self.progress.stop()
+
+    def on_train_step_end(self, run_context):
+        cb_params = run_context.original_args()
+        num_batches = cb_params.batch_num
+        cur_step = cb_params.cur_step_num
+        self.progress.update(self.task, completed=cur_step/num_batches)
 
 
 class ValCallback(Callback):
