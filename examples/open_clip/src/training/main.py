@@ -10,8 +10,7 @@ from time import time
 import numpy as np
 
 import mindspore as ms
-from mindspore import nn
-from mindspore.train.loss_scale_manager import DynamicLossScaleManager, FixedLossScaleManager
+from mindspore.amp import DynamicLossScaler, StaticLossScaler
 
 try:
     import wandb
@@ -29,7 +28,7 @@ from training.distributed import broadcast_object, init_distributed_device, is_m
 from training.logger import setup_logging
 from training.params import parse_args
 from training.scheduler import const_lr, const_lr_cooldown, cosine_lr
-from training.train import LATEST_CHECKPOINT_NAME, CallbackForCLIP, build_trainer, evaluate
+from training.train import LATEST_CHECKPOINT_NAME, AdamW, CallbackForCLIP, build_trainer, evaluate
 
 _logger = logging.getLogger(__name__)
 
@@ -54,15 +53,30 @@ def get_latest_checkpoint(path: str, remote: bool):
     return None
 
 
-def main(args):
-    args = parse_args(args)
+def check_args(args):
+    """some setting are not supported yet, but will be done in the future"""
+    assert args.use_bn_sync is False
+    assert args.skip_scheduler is False
+    assert args.pretrained_image is False, "`pretrained_image` is not implemented in `created_model`"
+    assert args.grad_checkpointing is False, "Gradient checkpointing is not supported"
+    assert args.gather_with_grad is False, "`gather_with_grad` is not implemented in `ClipLoss`"
     assert args.accum_freq == 1, (
         "CLIP use the cached features from the other batches as negatives when --accum-freq is larger than 1, "
         "which is not implemented yet."
     )
+    assert args.distill_model is None
+    assert args.distill_pretrained is None
+    assert args.siglip is False
+
+
+def main(args):
+    args = parse_args(args)
+    check_args(args)
 
     # fully initialize distributed device environment
+    ms.set_context(mode=ms.GRAPH_MODE)
     device = init_distributed_device(args)
+    random_seed(args.seed, 0)
 
     # get the name of the experiments
     if args.name is None:
@@ -80,7 +94,6 @@ def main(args):
                 f"lr_{args.lr}",
                 f"b_{args.batch_size}",
                 f"j_{args.workers}",
-                f"p_{args.precision}",
             ]
         )
 
@@ -89,7 +102,7 @@ def main(args):
     args.log_path = None
     if is_master(args, local=args.log_local):
         os.makedirs(log_base_path, exist_ok=True)
-        log_filename = f"out-{args.rank}" if args.log_local else "out.log"
+        log_filename = f"out-{args.rank}.log" if args.log_local else "out.log"
         args.log_path = os.path.join(log_base_path, log_filename)
         if os.path.exists(args.log_path) and not resume_latest:
             print("Error. Experiment already exists. Use --name {} to specify a new experiment.")
@@ -141,13 +154,12 @@ def main(args):
 
     if args.distributed:
         _logger.info(
-            f"Running in distributed mode with multiple processes. Device: {args.device}."
-            f"Process (global: {args.rank}, local {args.local_rank}), total {args.world_size}."
+            f"Running in distributed mode with multiple processes. Device: {args.device}. "
+            f"Process (global: {args.rank}, local {args.local_rank}, total {args.world_size})."
         )
     else:
         _logger.info(f"Running with a single process. Device {args.device}.")
 
-    dist_model = None
     args.distill = args.distill_model is not None and args.distill_pretrained is not None
     if args.distill:
         # FIXME: support distillation with grad accum.
@@ -158,7 +170,6 @@ def main(args):
     if isinstance(args.force_image_size, (tuple, list)) and len(args.force_image_size) == 1:
         # arg is nargs, single (square) image size list -> int
         args.force_image_size = args.force_image_size[0]
-    random_seed(args.seed, 0)
     model_kwargs = {}
     if args.siglip:
         model_kwargs["init_logit_scale"] = np.log(10)  # different from CLIP
@@ -175,14 +186,8 @@ def main(args):
         image_interpolation=args.image_interpolation,
         image_resize_mode=args.image_resize_mode,  # only effective for inference
         aug_cfg=args.aug_cfg,
-        pretrained_image=args.pretrained_image,
-        output_dict=True,
         **model_kwargs,
     )
-    if args.distill:
-        raise NotImplementedError("Distillation is not supported yet.")
-
-    random_seed(args.seed, args.rank)
 
     if args.lock_image:
         # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
@@ -260,22 +265,23 @@ def main(args):
         gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and p.requires_grad]
         rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
 
-        optimizer = nn.AdamWeightDecay(
+        optimizer = AdamW(
             [
                 {"params": gain_or_bias_params, "weight_decay": 0.0},
                 {"params": rest_params, "weight_decay": args.wd},
+                {"order_params": model.trainable_params()},
             ],
-            learning_rate=scheduler,
-            beta1=args.beta1,
-            beta2=args.beta2,
+            lr=scheduler,
+            betas=(args.beta1, args.beta2),
             eps=args.eps,
         )
 
-        loss_scale_type, loss_scale_value = "static", 65536.0
-        if loss_scale_type.lower() == "static":
-            scaler = FixedLossScaleManager(loss_scale=loss_scale_value, drop_overflow_update=False)
-        elif loss_scale_type.lower() == "dynamic":
-            scaler = DynamicLossScaleManager(init_loss_scale=loss_scale_value, scale_factor=2, scale_window=2000)
+        loss_scale_type, loss_scale_value = args.scaler.split("@")
+        loss_scale_type, loss_scale_value = loss_scale_type.lower(), float(loss_scale_value)
+        if loss_scale_type == "static":
+            scaler = StaticLossScaler(scale_value=loss_scale_value)
+        elif loss_scale_type == "dynamic":
+            scaler = DynamicLossScaler(scale_value=loss_scale_value, scale_factor=2, scale_window=2000)
         else:
             raise ValueError(f"Loss scale type only support ['static', 'dynamic'], but got{loss_scale_type}.")
 
@@ -335,8 +341,8 @@ def main(args):
     trainer = build_trainer(
         model, loss, optimizer, amp_level=args.amp_opt_level, scaler=scaler, grad_clip_norm=args.grad_clip_norm
     )
-    callbacks = [CallbackForCLIP]
-    trainer.train(args.epochs - start_epoch, data["train"].dataloader, callbacks=callbacks, dataset_sink_mode=True)
+    callbacks = [CallbackForCLIP(args, data, tokenizer, trainer, writer, start_epoch)]
+    trainer.train(args.epochs - start_epoch, data["train"].dataloader, callbacks=callbacks, dataset_sink_mode=False)
 
     if args.wandb and is_master(args):
         wandb.finish()

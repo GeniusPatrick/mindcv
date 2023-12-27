@@ -4,10 +4,11 @@ from .factory import (
     create_loss,
     create_model,
     create_model_and_transforms,
+    create_model_from_pretrained,
     get_model_config,
     get_tokenizer,
     list_models,
-    load_ckpt,
+    load_checkpoint,
 )
 from .loss import ClipLoss, DistillClipLoss
 from .model import (
@@ -17,7 +18,11 @@ from .model import (
     CustomTextCLIP,
     convert_weights_to_fp16,
     convert_weights_to_lp,
+    get_cast_dtype,
     get_input_dtype,
+    get_model_preprocess_cfg,
+    get_model_tokenize_cfg,
+    set_model_preprocess_cfg,
 )
 from .openai import list_openai_models, load_openai_model
 from .pretrained import (

@@ -1,24 +1,64 @@
+import numbers
 import random
 import warnings
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-import mindspore.nn as nn
-from mindspore import Tensor
+from PIL import Image
+
 from mindspore.dataset.transforms import Compose
-from mindspore.dataset.vision import (
-    CenterCrop,
-    Grayscale,
-    Inter,
-    Normalize,
-    Pad,
-    RandomColorAdjust,
-    RandomResizedCrop,
-    Resize,
-    ToTensor,
-)
+from mindspore.dataset.vision import CenterCrop, Grayscale
+from mindspore.dataset.vision import Inter as InterpolationMode
+from mindspore.dataset.vision import Normalize, Pad, RandomColorAdjust, RandomResizedCrop, Resize, ToTensor
 
 from .constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
+from .utils import to_2tuple
+
+
+@dataclass
+class PreprocessCfg:
+    size: Union[int, Tuple[int, int]] = 224
+    mode: str = "RGB"
+    mean: Tuple[float, ...] = OPENAI_DATASET_MEAN
+    std: Tuple[float, ...] = OPENAI_DATASET_STD
+    interpolation: str = "bicubic"
+    resize_mode: str = "shortest"
+    fill_color: int = 0
+
+    def __post_init__(self):
+        assert self.mode in ("RGB",)
+
+    @property
+    def num_channels(self):
+        return 3
+
+    @property
+    def input_size(self):
+        return (self.num_channels,) + to_2tuple(self.size)
+
+
+_PREPROCESS_KEYS = set(asdict(PreprocessCfg()).keys())
+
+
+def merge_preprocess_dict(
+    base: Union[PreprocessCfg, Dict],
+    overlay: Dict,
+):
+    """Merge overlay key-value pairs on top of base preprocess cfg or dict.
+    Input dicts are filtered based on PreprocessCfg fields.
+    """
+    if isinstance(base, PreprocessCfg):
+        base_clean = asdict(base)
+    else:
+        base_clean = {k: v for k, v in base.items() if k in _PREPROCESS_KEYS}
+    if overlay:
+        overlay_clean = {k: v for k, v in overlay.items() if k in _PREPROCESS_KEYS and v is not None}
+        base_clean.update(overlay_clean)
+    return base_clean
+
+
+def merge_preprocess_kwargs(base: PreprocessCfg, **kwargs):
+    return merge_preprocess_dict(base, kwargs)
 
 
 @dataclass
@@ -26,7 +66,6 @@ class AugmentationCfg:
     scale: Tuple[float, float] = (0.9, 1.0)
     ratio: Optional[Tuple[float, float]] = None
     color_jitter: Optional[Union[float, Tuple[float, float, float], Tuple[float, float, float, float]]] = None
-    interpolation: Optional[str] = None
     re_prob: Optional[float] = None
     re_count: Optional[int] = None
     # params for simclr_jitter_gray
@@ -34,32 +73,170 @@ class AugmentationCfg:
     gray_scale_prob: float = None
 
 
-class ResizeMaxSize(nn.Cell):
-    def __init__(self, max_size, interpolation=Inter.BICUBIC, fn="max", fill=0):
-        super().__init__()
-        if not isinstance(max_size, int):
-            raise TypeError(f"Size should be int. Got {type(max_size)}")
-        self.max_size = max_size
+def _setup_size(size, error_msg):
+    if isinstance(size, numbers.Number):
+        return int(size), int(size)
+
+    if isinstance(size, Sequence) and len(size) == 1:
+        return size[0], size[0]
+
+    if len(size) != 2:
+        raise ValueError(error_msg)
+
+    return size
+
+
+class ResizeKeepRatio:
+    """Resize and Keep Ratio
+
+    Copy & paste from `timm`
+    """
+
+    def __init__(
+        self,
+        size,
+        longest=0.0,
+        interpolation=InterpolationMode.BICUBIC,
+        random_scale_prob=0.0,
+        random_scale_range=(0.85, 1.05),
+        random_aspect_prob=0.0,
+        random_aspect_range=(0.9, 1.11),
+    ):
+        if isinstance(size, (list, tuple)):
+            self.size = tuple(size)
+        else:
+            self.size = (size, size)
         self.interpolation = interpolation
-        self.fn = min if fn == "min" else min
+        self.longest = float(longest)  # [0, 1] where 0 == shortest edge, 1 == longest
+        self.random_scale_prob = random_scale_prob
+        self.random_scale_range = random_scale_range
+        self.random_aspect_prob = random_aspect_prob
+        self.random_aspect_range = random_aspect_range
+
+    @staticmethod
+    def get_params(
+        img,
+        target_size,
+        longest,
+        random_scale_prob=0.0,
+        random_scale_range=(0.85, 1.05),
+        random_aspect_prob=0.0,
+        random_aspect_range=(0.9, 1.11),
+    ):
+        """Get parameters"""
+        source_size = img.size[::-1]  # h, w
+        h, w = source_size
+        target_h, target_w = target_size
+        ratio_h = h / target_h
+        ratio_w = w / target_w
+        ratio = max(ratio_h, ratio_w) * longest + min(ratio_h, ratio_w) * (1.0 - longest)
+        if random_scale_prob > 0 and random.random() < random_scale_prob:
+            ratio_factor = random.uniform(random_scale_range[0], random_scale_range[1])
+            ratio_factor = (ratio_factor, ratio_factor)
+        else:
+            ratio_factor = (1.0, 1.0)
+        if random_aspect_prob > 0 and random.random() < random_aspect_prob:
+            aspect_factor = random.uniform(random_aspect_range[0], random_aspect_range[1])
+            ratio_factor = (ratio_factor[0] / aspect_factor, ratio_factor[1] * aspect_factor)
+        size = [round(x * f / ratio) for x, f in zip(source_size, ratio_factor)]
+        return size
+
+    def __call__(self, img: Image.Image):
+        """
+        Args:
+            img (PIL Image): Image to be cropped and resized.
+
+        Returns:
+            PIL Image: Resized, padded to at least target size, possibly cropped to exactly target size
+        """
+        size = self.get_params(
+            img,
+            self.size,
+            self.longest,
+            self.random_scale_prob,
+            self.random_scale_range,
+            self.random_aspect_prob,
+            self.random_aspect_range,
+        )
+        img = Resize(size, self.interpolation)(img)
+        return img
+
+    def __repr__(self):
+        format_string = self.__class__.__name__ + "(size={0}".format(self.size)
+        format_string += f", interpolation={self.interpolation})"
+        format_string += f", longest={self.longest:.3f})"
+        return format_string
+
+
+def center_crop_or_pad(img: Image.Image, output_size: List[int], fill=0) -> Image.Image:
+    """Center crops and/or pads the given image.
+    If the image is torch Tensor, it is expected
+    to have [..., H, W] shape, where ... means an arbitrary number of leading dimensions.
+    If image size is smaller than output size along any edge, image is padded with 0 and then center cropped.
+
+    Args:
+        img (PIL Image or Tensor): Image to be cropped.
+        output_size (sequence or int): (height, width) of the crop box. If int or sequence with single int,
+            it is used for both directions.
+        fill (int, Tuple[int]): Padding color
+
+    Returns:
+        PIL Image or Tensor: Cropped image.
+    """
+    if isinstance(output_size, numbers.Number):
+        output_size = (int(output_size), int(output_size))
+    elif isinstance(output_size, (tuple, list)) and len(output_size) == 1:
+        output_size = (output_size[0], output_size[0])
+
+    image_height, image_width = img.height, img.width
+    crop_height, crop_width = output_size
+
+    if crop_width > image_width or crop_height > image_height:
+        padding_ltrb = [
+            (crop_width - image_width) // 2 if crop_width > image_width else 0,
+            (crop_height - image_height) // 2 if crop_height > image_height else 0,
+            (crop_width - image_width + 1) // 2 if crop_width > image_width else 0,
+            (crop_height - image_height + 1) // 2 if crop_height > image_height else 0,
+        ]
+        img = Pad(padding_ltrb, fill=fill)(img)
+        image_height, image_width = img.height, img.width
+        if crop_width == image_width and crop_height == image_height:
+            return img
+
+    crop_top = int(round((image_height - crop_height) / 2.0))
+    crop_left = int(round((image_width - crop_width) / 2.0))
+    return img.crop((crop_left, crop_top, crop_left + crop_width, crop_top + crop_height))
+
+
+class CenterCropOrPad:
+    """Crops the given image at the center.
+    If the image is torch Tensor, it is expected
+    to have [..., H, W] shape, where ... means an arbitrary number of leading dimensions.
+    If image size is smaller than output size along any edge, image is padded with 0 and then center cropped.
+
+    Args:
+        size (sequence or int): Desired output size of the crop. If size is an
+            int instead of sequence like (h, w), a square crop (size, size) is
+            made. If provided a sequence of length 1, it will be interpreted as (size[0], size[0]).
+    """
+
+    def __init__(self, size, fill=0):
+        super().__init__()
+        self.size = _setup_size(size, error_msg="Please provide only two dimensions (h, w) for size.")
         self.fill = fill
 
-    def construct(self, img):
-        if isinstance(img, Tensor):
-            height, width = img.shape[:2]
-        else:
-            width, height = img.size
-        scale = self.max_size / float(max(height, width))
-        new_size = tuple(round(dim * scale) for dim in (height, width))
-        if scale != 1.0:
-            img = Resize(new_size, self.interpolation)(img)
-            if not width == height:
-                pad_h = self.max_size - new_size[0]
-                pad_w = self.max_size - new_size[1]
-                img = Pad(
-                    padding=[pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2], fill_value=self.fill
-                )(img)
-        return img
+    def __call__(self, img):
+        """
+        Args:
+            img (PIL Image or Tensor): Image to be cropped.
+
+        Returns:
+            PIL Image or Tensor: Cropped image.
+        """
+        return center_crop_or_pad(img, self.size, fill=self.fill)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(size={self.size})"
 
 
 def _convert_to_rgb(image):
@@ -101,11 +278,12 @@ class gray_scale(object):
 
 
 def image_transform(
-    image_size: int,
+    image_size: Union[int, Tuple[int, int]],
     is_train: bool,
     mean: Optional[Tuple[float, ...]] = None,
     std: Optional[Tuple[float, ...]] = None,
-    resize_longest_max: bool = False,
+    resize_mode: Optional[str] = None,
+    interpolation: Optional[str] = None,
     fill_color: int = 0,
     aug_cfg: Optional[Union[Dict[str, Any], AugmentationCfg]] = None,
 ):
@@ -117,9 +295,13 @@ def image_transform(
     if not isinstance(std, (list, tuple)):
         std = (std,) * 3
 
-    if isinstance(image_size, (list, tuple)) and image_size[0] == image_size[1]:
-        # for square size, pass size as int so that Resize() uses aspect preserving shortest edge
-        image_size = image_size[0]
+    interpolation = interpolation or "bicubic"
+    assert interpolation in ["bicubic", "bilinear", "random"]
+    # NOTE random is ignored for interpolation_mode, so defaults to BICUBIC for inference if set
+    interpolation_mode = InterpolationMode.BILINEAR if interpolation == "bilinear" else InterpolationMode.BICUBIC
+
+    resize_mode = resize_mode or "shortest"
+    assert resize_mode in ("shortest", "longest", "squash")
 
     if isinstance(aug_cfg, dict):
         aug_cfg = AugmentationCfg(**aug_cfg)
@@ -132,7 +314,7 @@ def image_transform(
             RandomResizedCrop(
                 image_size,
                 scale=aug_cfg_dict.pop("scale"),
-                interpolation=Inter.BICUBIC,
+                interpolation=InterpolationMode.BICUBIC,
             ),
             _convert_to_rgb,
         ]
@@ -155,13 +337,29 @@ def image_transform(
             )  # TODO: add hyper-parameter use_mindcv later and then use transform strategy of mindcv alternatively.
         return train_transform
     else:
-        if resize_longest_max:
-            transforms = [ResizeMaxSize(image_size, fill=fill_color)]
-        else:
+        if resize_mode == "longest":
             transforms = [
-                Resize(image_size, interpolation=Inter.BICUBIC),
-                CenterCrop(image_size),
+                ResizeKeepRatio(image_size, interpolation=interpolation_mode, longest=1),
+                CenterCropOrPad(image_size, fill=fill_color),
             ]
+        elif resize_mode == "squash":
+            if isinstance(image_size, int):
+                image_size = (image_size, image_size)
+            transforms = [
+                Resize(image_size, interpolation=interpolation_mode),
+            ]
+        else:
+            assert resize_mode == "shortest"
+            if not isinstance(image_size, (tuple, list)):
+                image_size = (image_size, image_size)
+            if image_size[0] == image_size[1]:
+                # simple case, use torchvision built-in Resize w/ shortest edge mode (scalar size arg)
+                transforms = [Resize(image_size[0], interpolation=interpolation_mode)]
+            else:
+                # resize shortest edge to matching target dim for non-square target
+                transforms = [ResizeKeepRatio(image_size, interpolation=interpolation_mode)]
+            transforms += [CenterCrop(image_size)]
+
         transforms.extend(
             [
                 _convert_to_rgb,
@@ -170,3 +368,20 @@ def image_transform(
             ]
         )
         return Compose(transforms)
+
+
+def image_transform_v2(
+    cfg: PreprocessCfg,
+    is_train: bool,
+    aug_cfg: Optional[Union[Dict[str, Any], AugmentationCfg]] = None,
+):
+    return image_transform(
+        image_size=cfg.size,
+        is_train=is_train,
+        mean=cfg.mean,
+        std=cfg.std,
+        interpolation=cfg.interpolation,
+        resize_mode=cfg.resize_mode,
+        fill_color=cfg.fill_color,
+        aug_cfg=aug_cfg,
+    )

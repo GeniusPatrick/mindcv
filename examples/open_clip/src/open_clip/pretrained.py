@@ -4,15 +4,21 @@ from typing import Dict, Union
 
 from tqdm import tqdm
 
+from .constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
+
 
 # TODO: replace url content(ckpt path) below.
-def _pcfg(url="", hf_hub="", mean=None, std=None):
-    return dict(
-        url=url,
-        hf_hub=hf_hub,
-        mean=mean,
-        std=std,
-    )
+def _pcfg(url="", hf_hub="", **kwargs):
+    # OpenAI / OpenCLIP defaults
+    return {
+        "url": url,
+        "hf_hub": hf_hub,
+        "mean": OPENAI_DATASET_MEAN,
+        "std": OPENAI_DATASET_STD,
+        "interpolation": "bicubic",
+        "resize_mode": "shortest",
+        **kwargs,
+    }
 
 
 _RN50 = dict(

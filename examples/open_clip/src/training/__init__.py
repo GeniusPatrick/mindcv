@@ -2,6 +2,7 @@
 # https://github.com/mlfoundations/open_clip/issues/22
 # https://github.com/mlfoundations/open_clip/issues/300
 # https://github.com/mlfoundations/open_clip/issues/448
+# https://github.com/mlfoundations/open_clip/issues/464
 
 # cc3m
 # 2,862,387 ???

@@ -6,30 +6,35 @@ from open_clip import (
     build_zero_shot_classifier,
     get_tokenizer,
 )
-from tqdm import tqdm
 
 _logger = logging.getLogger(__name__)
+_USE_TQDM = False
 
 
 def accuracy(output, target, topk=(1,)):
     pred = output.topk(max(topk), 1, True, True)[1].t()
-    correct = pred.eq(target.view(1, -1).expand_as(pred))
-    return [float(correct[:k].reshape(-1).float().sum(0, keepdim=True).numpy()) for k in topk]
+    correct = pred.equal(target.view(1, -1).expand_as(pred))
+    return [float(correct[:k].reshape(-1).float().sum(0, keepdims=True).numpy()) for k in topk]
 
 
 def run(model, classifier, dataloader, args):
     top1, top5, n = 0.0, 0.0, 0.0
-    for images, target in tqdm(dataloader, unit_scale=args.batch_size):
+    if _USE_TQDM:
+        from tqdm import tqdm
+
+        tuple_iterator = tqdm(dataloader.create_tuple_iterator(), unit_scale=args.batch_size, total=len(dataloader))
+    else:
+        tuple_iterator = dataloader.create_tuple_iterator()
+    for images, target in tuple_iterator:
         # predict
-        output = model(image=images)
-        image_features = output["image_features"] if isinstance(output, dict) else output[0]
+        image_features = model.encode_image(images, normalize=True)
         logits = 100.0 * image_features @ classifier
 
         # measure accuracy
         acc1, acc5 = accuracy(logits, target, topk=(1, 5))
         top1 += acc1
         top5 += acc5
-        n += images.size(0)
+        n += images.shape[0]
 
     top1 = top1 / n
     top5 = top5 / n
@@ -55,7 +60,7 @@ def zero_shot_eval(model, data, epoch, args, tokenizer=None):
         classnames=IMAGENET_CLASSNAMES,
         templates=OPENAI_IMAGENET_TEMPLATES,
         num_classes_per_batch=10,
-        use_tqdm=True,
+        use_tqdm=_USE_TQDM,
     )
 
     _logger.info("Using classifier")

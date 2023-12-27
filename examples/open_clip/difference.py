@@ -3,18 +3,17 @@ With 2 folder paths provided,
 this script will output absolute as well as relative difference of paired files.
 
 Examples:
-python difference.py --a_path=./results_a/ --b_path=./results_b/
+    python difference.py --a_path=./results_a/ --b_path=./results_b/
 
 """
 
 import argparse
 import os
-import sys
 
 import numpy as np
 
 
-def parse_args(args):
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--a_path",
@@ -28,50 +27,47 @@ def parse_args(args):
         default=None,
         help="Another folder path containing at least one .txt file of model results",
     )
-    args = parser.parse_args(args)
+    args = parser.parse_args()
     return args
 
 
 def difference(a_file, b_file):
-    file = open(a_file, "r")
-    a_variable = eval(file.read())
-    file.close()
+    with open(a_file, "r") as f:
+        a = eval(f.read())
+    with open(b_file, "r") as f:
+        b = eval(f.read())
+    if not isinstance(b, np.ndarray):
+        b = np.array(b)
+    if not isinstance(a, np.ndarray):
+        a = np.array(a)
 
-    file = open(b_file, "r")
-    b_variable = eval(file.read())
-    file.close()
-
-    if not isinstance(b_variable, np.ndarray):
-        b_variable = np.array(b_variable)
-    if not isinstance(a_variable, np.ndarray):
-        a_variable = np.array(a_variable)
-
-    if b_variable.shape != a_variable.shape:
+    if b.shape != a.shape:
         raise ValueError(
-            f"{a_variable} has shape {a_variable.shape} "
-            f"while {b_variable} has different shape of {b_variable.shape}."
+            f"{a} has shape {a.shape} "
+            f"while {b} has different shape of {b.shape}."
         )
 
     # abs diff (mean)
-    abs_mean = abs(a_variable - b_variable).mean()
-
+    abs_mean = np.mean(np.abs(a - b))
     # abs diff (max)
-    abs_max = abs(a_variable - b_variable).max()
-
+    abs_max = np.max(np.abs(a - b))
     # relative diff (mean)
-    rel_mean = (abs(a_variable - b_variable) / (abs(b_variable) + 1e-6)).mean()
-
+    rel_mean = np.mean(np.abs(a - b) / (np.abs(b) + 1e-6))
     # relative diff (max)
-    rel_max = (abs(a_variable - b_variable) / (abs(b_variable) + 1e-6)).max()
+    rel_max = np.max(np.abs(a - b) / (np.abs(b) + 1e-6))
 
     print(
-        f'{os.path.basename(a_file).replace(".txt",": ")}\n abs_mean: {abs_mean}\n '
-        f"abs_max: {abs_max}\n rel_mean: {rel_mean}\n rel_max: {rel_max}\n\n"
+        f"{os.path.basename(a_file).replace('.txt', ':')}\n"
+        f" absolute error(mean):       {abs_mean}\n"
+        f" absolute error(max):        {abs_max}\n"
+        f" relative error(mean):       {rel_mean}\n"
+        f" relative error(max):        {rel_max}\n"
+        f" relative error(max / mean): {np.max(np.abs(a - b)) / np.mean(np.abs(b))}\n"
     )
 
 
-def main(args):
-    args = parse_args(args)
+def main():
+    args = parse_args()
 
     a_files = []
     b_files = []
@@ -85,12 +81,12 @@ def main(args):
     b_files = sorted(b_files)
 
     if len(a_files) != len(b_files):
-        raise ValueError(f"Files in {args.a_path} are diiferent with those in {args.b_path}.")
+        raise ValueError(f"Files in {args.a_path} are different with those in {args.b_path}.")
     for file in range(len(a_files)):
         if os.path.basename(a_files[file]) != os.path.basename(b_files[file]):
-            raise ValueError(f"Files in {args.a_path} are diiferent with those in {args.b_path}.")
+            raise ValueError(f"Files in {args.a_path} are different with those in {args.b_path}.")
         difference(a_files[file], b_files[file])
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()

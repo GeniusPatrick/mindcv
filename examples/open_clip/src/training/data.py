@@ -6,6 +6,8 @@ import os
 import random
 import sys
 from dataclasses import dataclass
+from functools import partial
+from itertools import islice
 from multiprocessing import Value
 
 import braceexpand
@@ -17,7 +19,7 @@ from webdataset.filters import _shuffle
 from webdataset.tariterators import base_plus_ext, tar_file_expander, url_opener, valid_sample
 
 import mindspore as ms
-from mindspore.dataset import DistributedSampler, GeneratorDataset, ImageFolderDataset, SubsetRandomSampler
+from mindspore.dataset import DistributedSampler, GeneratorDataset, ImageFolderDataset, SubsetRandomSampler, vision
 
 _logger = logging.getLogger(__name__)
 
@@ -27,6 +29,7 @@ class CsvDataset:  # Dataset, RandomAccess
         _logger.debug(f"Loading csv data from {input_filename}.")
         df = pd.read_csv(input_filename, sep=sep)
 
+        self.image_root = os.path.join(os.path.dirname(input_filename), "images")
         self.images = df[img_key].tolist()
         self.captions = df[caption_key].tolist()
         self.transforms = transforms
@@ -38,7 +41,7 @@ class CsvDataset:  # Dataset, RandomAccess
         return len(self.captions)
 
     def __getitem__(self, idx):
-        images = self.transforms(Image.open(str(self.images[idx])))
+        images = self.transforms(Image.open(os.path.join(self.image_root, str(self.images[idx]))))[0]
         texts = self.tokenize([str(self.captions[idx])])[0]
         return images, texts
 
@@ -98,12 +101,19 @@ def get_dataset_size(shards):
     dir_path = os.path.dirname(shards_list[0])
     sizes_filename = os.path.join(dir_path, "sizes.json")
     len_filename = os.path.join(dir_path, "__len__")
+    stats_filenames = [shard_name.replace(".tar", "_stats.json") for shard_name in shards_list]
     if os.path.exists(sizes_filename):
         sizes = json.load(open(sizes_filename, "r"))
         total_size = sum([int(sizes[os.path.basename(shard)]) for shard in shards_list])
     elif os.path.exists(len_filename):
         # FIXME this used to be eval(open(...)) but that seemed rather unsafe
         total_size = ast.literal_eval(open(len_filename, "r").read())
+    elif all([os.path.exists(stats_filename) for stats_filename in stats_filenames]):
+        total_size = 0
+        for stats_filename in stats_filenames:
+            with open(stats_filename) as f:
+                stats = json.load(f)
+                total_size += stats["successes"]
     else:
         total_size = None  # num samples undefined
         # some common dataset sizes (at time of authors last download)
@@ -131,8 +141,11 @@ def get_imagenet(args, preprocess_fns, split):
             preprocess_fn = preprocess_val
         assert data_path
 
-        dataset = ImageFolderDataset(data_path, num_parallel_workers=args.workers).map(
-            operations=preprocess_fn,
+        workers = args.workers if is_train else 1
+        # TODO: Maybe we need reimplement ImageFolder in python and wrap it by GenerateDataset,
+        #  which give exactly same image transform.
+        dataset = ImageFolderDataset(data_path, num_parallel_workers=workers).map(
+            operations=[vision.Decode(to_pil=True), preprocess_fn],
             input_columns="image",
         )
 
@@ -156,7 +169,8 @@ def get_imagenet(args, preprocess_fns, split):
     else:
         sampler = None
 
-    dataloader = dataset.batch(args.batch_size)
+    batch_size = args.batch_size  # if is_train else 16
+    dataloader = dataset.batch(batch_size)
 
     return DataInfo(dataloader=dataloader, sampler=sampler)
 
@@ -219,12 +233,31 @@ def tarfile_to_samples_nothrow(src, handler=log_and_continue):
     return samples
 
 
+def split_by_node(src, rank, world_size):  # maybe split_by_rank is a better name
+    if world_size > 1:
+        yield from islice(src, rank, None, world_size)
+    else:
+        yield from src
+
+
+def split_by_worker(src, worker, num_workers):
+    assert num_workers == 1, (
+        "The number of workers must be 1. "
+        "Reason: 1. We cannot get worker_id from MindData. 2. GeneratorDataset does not support sharding iterator."
+    )
+    if num_workers > 1:
+        yield from islice(src, worker, None, num_workers)
+    else:
+        yield from src
+
+
 def mindspore_worker_seed(args, increment=0):
     """get dataloader worker seed from pytorch"""
-    # TODO: we actually cannot get seed of each dataloader worker, but only seed of each rank.
-    seed = ms.get_seed() + args.rank
+    # TODO: we actually cannot get seed of each dataloader worker(ms.dataset.get_seed()?), but only seed of each rank.
+    #  the seed of each worker should be base_seed + rank * workers + worker_id.
+    seed = (args.seed or 0) + args.rank
     # space out seed increments, so they can't overlap across workers in different iterations
-    seed += increment * max(1, args.world_size)
+    seed += increment * max(1, args.world_size * args.workers)
     return seed
 
 
@@ -234,20 +267,10 @@ _SAMPLE_SHUFFLE_SIZE = 5000
 _SAMPLE_SHUFFLE_INITIAL = 1000
 
 
-class DetShuffle2(wds.PipelineStage):
-    def __init__(
-        self,
-        args,
-        bufsize=1000,
-        initial=100,
-        seed=0,
-        epoch=-1,
-    ):
+class detshuffle2(wds.detshuffle):
+    def __init__(self, args, bufsize=1000, initial=100, seed=0, epoch=-1):
+        super().__init__(bufsize, initial, seed, epoch)
         self.args = args
-        self.bufsize = bufsize
-        self.initial = initial
-        self.seed = seed
-        self.epoch = epoch
 
     def run(self, src):
         if isinstance(self.epoch, SharedEpoch):
@@ -268,7 +291,7 @@ class DetShuffle2(wds.PipelineStage):
         return _shuffle(src, self.bufsize, self.initial, rng)
 
 
-class ResampledShards2:  # IterableDataset
+class ResampledShards2(wds.SimpleShardList):  # IterableDataset
     """An iterable dataset yielding a list of urls."""
 
     def __init__(
@@ -285,7 +308,7 @@ class ResampledShards2:  # IterableDataset
 
         :param urls: a list of URLs as a Python list or brace notation string
         """
-        super().__init__()
+        super().__init__(urls)
         self.args = args
         urls, weights = expand_urls(urls, weights)
         self.urls = urls
@@ -336,6 +359,7 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
             num_samples = args.train_num_samples
         else:
             num_samples, num_shards = get_dataset_size(input_shards)
+            _logger.info(f"Number of samples: {num_samples}, number of shards: {num_shards}")
             if not num_samples:
                 raise RuntimeError(
                     "Currently, the number of dataset samples must be specified for the training dataset. "
@@ -353,35 +377,31 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
             "when sampling with replacement (with --dataset-resampled)."
         )
 
-    if resampled:
-        pipeline = [
-            ResampledShards2(
-                args,
-                input_shards,
-                weights=args.train_data_upsampling_factors,
-                deterministic=True,
-                epoch=shared_epoch,
-            )
-        ]
-    else:
-        pipeline = [wds.SimpleShardList(input_shards)]
-
-    # at this point we have an iterator over all the shards
     if is_train:
-        if not resampled:
-            pipeline.extend(
-                [
-                    DetShuffle2(
-                        args,
-                        bufsize=_SHARD_SHUFFLE_SIZE,
-                        initial=_SHARD_SHUFFLE_INITIAL,
-                        seed=args.seed,
-                        epoch=shared_epoch,
-                    ),
-                    wds.split_by_node,
-                    wds.split_by_worker,
-                ]
-            )
+        if resampled:
+            pipeline = [
+                ResampledShards2(
+                    args,
+                    input_shards,
+                    weights=args.train_data_upsampling_factors,
+                    deterministic=True,
+                    epoch=shared_epoch,
+                )
+            ]
+        else:
+            pipeline = [
+                wds.SimpleShardList(input_shards),  # at this point we have an iterator over all the shards
+                detshuffle2(
+                    args,
+                    bufsize=_SHARD_SHUFFLE_SIZE,
+                    initial=_SHARD_SHUFFLE_INITIAL,
+                    seed=args.seed,
+                    epoch=shared_epoch,
+                ),
+                partial(split_by_node, rank=args.rank, world_size=args.world_size),
+                partial(split_by_worker, worker=0, num_workers=args.workers),
+                # TODO: what if some worker is assigned the shards with much less samples than others?
+            ]
         pipeline.extend(
             [
                 # at this point, we have an iterator over the shards assigned to each worker at each node
@@ -393,19 +413,18 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
             ]
         )
     else:
-        pipeline.extend(
-            [
-                wds.split_by_worker,
-                # at this point, we have an iterator over the shards assigned to each worker
-                wds.tarfile_to_samples(handler=log_and_continue),
-            ]
-        )
+        pipeline = [
+            wds.SimpleShardList(input_shards),
+            partial(split_by_worker, worker=0, num_workers=args.workers),
+            # at this point, we have an iterator over the shards assigned to each worker
+            wds.tarfile_to_samples(handler=log_and_continue),
+        ]
     pipeline.extend(
         [
             wds.select(filter_no_caption_or_no_image),
             wds.decode("pilrgb", handler=log_and_continue),
             wds.rename(image="jpg;png;jpeg;webp", text="txt"),
-            wds.map_dict(image=preprocess_img, text=lambda text: tokenizer(text)[0]),
+            wds.map_dict(image=lambda img: preprocess_img(img)[0], text=lambda text: tokenizer(text)[0]),
             wds.to_tuple("image", "text"),
             wds.batched(args.batch_size, partial=not is_train),
         ]
@@ -430,7 +449,8 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
         # last batches are partial, eval is done on single (master) node
         num_batches = math.ceil(num_samples / args.batch_size)
 
-    dataloader = GeneratorDataset(dataset, num_parallel_workers=args.workers)
+    workers = args.workers if is_train else 1
+    dataloader = GeneratorDataset(dataset, column_names=["images", "texts"], num_parallel_workers=workers)
 
     # FIXME not clear which approach is better, with_epoch before vs after dataloader?
     # hoping to resolve via https://github.com/webdataset/webdataset/issues/169
@@ -466,14 +486,17 @@ def get_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     )
     num_samples = len(dataset)
     sampler = DistributedSampler(args.world_size, args.rank) if args.distributed and is_train else None
-    shuffle = is_train and sampler is None
+    shuffle = True if is_train and sampler is None else None
 
+    workers = args.workers if is_train else 1
+    batch_size = args.batch_size  # if is_train else 16
     dataloader = GeneratorDataset(
         dataset,
+        column_names=["images", "texts"],
         shuffle=shuffle,
-        num_parallel_workers=args.workers,
+        num_parallel_workers=workers,
         sampler=sampler,
-    ).batch(batch_size=args.batch_size, drop_remainder=is_train)
+    ).batch(batch_size=batch_size, drop_remainder=is_train)
     dataloader.num_samples = num_samples
     dataloader.num_batches = len(dataloader)
 
@@ -515,14 +538,17 @@ def get_synthetic_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None
     )
     num_samples = len(dataset)
     sampler = DistributedSampler(args.world_size, args.rank) if args.distributed and is_train else None
-    shuffle = is_train and sampler is None
+    shuffle = True if is_train and sampler is None else None
 
+    workers = args.workers if is_train else 1
+    batch_size = args.batch_size  # if is_train else 16
     dataloader = GeneratorDataset(
         dataset,
+        column_names=["images", "texts"],
         shuffle=shuffle,
-        num_parallel_workers=args.workers,
+        num_parallel_workers=workers,
         sampler=sampler,
-    ).batch(batch_size=args.batch_size, drop_remainder=is_train)
+    ).batch(batch_size=batch_size, drop_remainder=is_train)
     dataloader.num_samples = num_samples
     dataloader.num_batches = len(dataloader)
 
@@ -573,7 +599,7 @@ def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
 
 if __name__ == "__main__":
 
-    class RandomDataset:
+    class RandomDatasetMap:
         def __getitem__(self, index):
             data = np.random.randint(0, 1000, 3)
             data[0] = index
@@ -582,24 +608,84 @@ if __name__ == "__main__":
         def __len__(self):
             return 8
 
-    def run_toy():
-        dataset = RandomDataset()
-        sampler = DistributedSampler(num_shards=2, shard_id=0, shuffle=True)
+    def run_toy_map(rank):
+        ms.dataset.set_seed(0)
+        dataset = RandomDatasetMap()
+        # sampler = DistributedSampler(num_shards=2, shard_id=0, shuffle=True)
         dataloader = GeneratorDataset(
             dataset,
             column_names=["data"],
             # sampler=sampler,
             shuffle=True,
             num_shards=2,
-            shard_id=0,
+            shard_id=rank,
+            num_parallel_workers=3,
+        ).batch(batch_size=2)
+        # dataloader = dataloader.create_tuple_iterator()
+        for epoch in range(2):
+            ms.dataset.set_seed(epoch + rank)
+            # sampler.seed += epoch
+            print(f"Epoch {epoch}")
+            for batch in dataloader.create_tuple_iterator():
+                print(batch[0].numpy())
+            print("-" * 25)
+
+    run_toy_map(0)
+    run_toy_map(1)
+
+    class RandomDatasetIter:
+        def __iter__(self):
+            for index in range(8):  # the length is 8
+                data = np.random.randint(0, 1000, 3)
+                data[0] = index
+                yield data
+
+    def run_toy_iter():
+        ms.dataset.set_seed(0)
+        dataset = RandomDatasetIter()  # does not support shard when using iterator
+        dataloader = GeneratorDataset(
+            dataset,
+            column_names=["data"],
+            shuffle=True,
             num_parallel_workers=3,
         ).batch(batch_size=2)
         for epoch in range(2):
             ms.dataset.set_seed(epoch)
-            sampler.seed += epoch
+            # sampler.seed += epoch
             print(f"Epoch {epoch}")
             for batch in dataloader.create_tuple_iterator():
-                print(batch)
+                print(batch[0].numpy())
             print("-" * 25)
 
-    run_toy()
+    # run_toy_iter()
+
+    def run_wds():
+        from dataclasses import dataclass
+
+        @dataclass
+        class WDSConfig:
+            debug = False
+            dataset_type = "auto"
+
+            train_data = "/Users/wyf/Dataset/cc3m/cc3m/{00000..00001}.tar"
+            train_data_upsampling_factors = None
+            dataset_resampled = True
+            train_num_samples = None
+            val_data = "/Users/wyf/Dataset/cc3m/cc3m/{00000..00001}.tar"
+            val_num_samples = None
+            imagenet_val = None
+            imagenet_v2 = None
+
+            batch_size = 4
+            workers = 1
+            seed = 0
+            distributed = False
+            world_size = 1
+            local_rank = 0
+            rank = 0
+
+        data = get_data(WDSConfig(), [lambda x: x, lambda x: x], 0, lambda x: x)
+        for batch in data["train"].dataloader.create_tuple_iterator():
+            print(batch[1])
+
+    # run_wds()

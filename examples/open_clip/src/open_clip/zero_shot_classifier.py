@@ -2,7 +2,7 @@ from functools import partial
 from itertools import islice
 from typing import Callable, Optional, Sequence, Union
 
-from mindspore import ops
+from mindspore import Tensor, ops
 
 
 def batched(iterable, n):
@@ -51,8 +51,8 @@ def build_zero_shot_classifier(
     def _process_batch(batch_classnames):
         num_batch_classes = len(batch_classnames)
         texts = [template.format(c) if use_format else template(c) for c in batch_classnames for template in templates]
-        texts = tokenizer(texts)
-        class_embeddings = ops.L2Normalize(-1)(model.encode_text(texts))
+        texts = Tensor(tokenizer(texts))
+        class_embeddings = model.encode_text(texts, normalize=True)
         class_embeddings = class_embeddings.reshape((num_batch_classes, num_templates, -1)).mean(axis=1)
         class_embeddings = class_embeddings / class_embeddings.norm(dim=1, keepdim=True)
         class_embeddings = class_embeddings.T
@@ -95,7 +95,7 @@ def build_zero_shot_classifier_legacy(
     zeroshot_weights = []
     for classname in iter_wrap(classnames):
         texts = [template.format(classname) if use_format else template(classname) for template in templates]
-        texts = tokenizer(texts)  # tokenize
+        texts = Tensor(tokenizer(texts))  # tokenize
         class_embeddings = model.encode_text(texts)
         class_embedding = ops.L2Normalize(-1)(class_embeddings).mean(axis=0)
         class_embedding /= class_embedding.norm()

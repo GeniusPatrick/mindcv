@@ -2,18 +2,30 @@
 
 Adapted from https://github.com/openai/CLIP. Originally MIT License, Copyright (c) 2021 OpenAI.
 """
+import copy
 import logging
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from functools import partial
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 
 import mindspore as ms
-from mindspore import Parameter, Tensor, load_param_into_net, nn, ops
+from mindspore import Parameter, Tensor, nn, ops
 
 from .modified_resnet import ModifiedResNet
-from .transformer import Attention, QuickGELU, TextTransformer, VisionTransformer
+from .transformer import (
+    GELU,
+    Attention,
+    LayerNorm,
+    LayerNormFp32,
+    MultiheadAttention,
+    QuickGELU,
+    TextTransformer,
+    VisionTransformer,
+    text_global_pool,
+)
 from .utils import to_2tuple
 
 
@@ -27,45 +39,70 @@ class CLIPVisionCfg:
     image_size: Union[Tuple[int, int], int] = 224
 
     ls_init_value: Optional[float] = None  # layer scale initial value
-    patch_dropout: float = 0.0  # what fraction of patches to dropout during training (0 would mean disabled and no patches dropped) - 0.5 to 0.75 recommended in the paper for optimal results # noqa
-    input_patchnorm: bool = False  # whether to use dual patchnorm - would only apply the input layernorm on each patch, as post-layernorm already exist in original clip vit design # noqa
-    global_average_pool: bool = False  # whether to global average pool the last embedding layer, instead of using CLS token (https://arxiv.org/abs/2205.01580) # noqa
-    attentional_pool: bool = False  # whether to use attentional pooler in the last embedding layer
-    n_queries: int = 256  # n_queries for attentional pooler
+    patch_dropout: float = 0.0  # what fraction of patches to dropout during training (0 would mean disabled and no patches dropped) - 0.5 to 0.75 recommended in the paper for optimal results  # noqa: E501
+    attentional_pool: bool = False  # use attentional pooler in the last embedding layer (overrides pool_type)
+    attn_pooler_queries: int = 256  # n_queries for attentional pooler
     attn_pooler_heads: int = 8  # n heads for attentional_pooling
+    no_ln_pre: bool = False  # disable pre transformer LayerNorm
+    pos_embed_type: str = "learnable"
+    final_ln_after_pool: bool = False  # apply final LayerNorm after pooling
+    pool_type: str = "tok"
     output_tokens: bool = False
+    act_kwargs: Optional[dict] = None
+    norm_kwargs: Optional[dict] = None
 
 
 @dataclass
 class CLIPTextCfg:
     context_length: int = 77
     vocab_size: int = 49408
+    hf_tokenizer_name: Optional[str] = None
+    tokenizer_kwargs: Optional[dict] = None
+
     width: int = 512
     heads: int = 8
     layers: int = 12
+    mlp_ratio: float = 4.0
     ls_init_value: Optional[float] = None  # layer scale initial value
-    proj: str = "mlp"
-    pooler_type: str = "mean_pooler"
     embed_cls: bool = False
     pad_id: int = 0
+    no_causal_mask: bool = False  # disable causal masking
+    final_ln_after_pool: bool = False  # apply final LayerNorm after pooling
+    pool_type: str = "argmax"
+    proj_bias: bool = False
     output_tokens: bool = False
-    text_mask: str = "first"  # default first truncate in bpe_tokenizer
+    act_kwargs: dict = None
+    norm_kwargs: dict = None
+
+
+def get_cast_dtype(precision: str):
+    cast_dtype = None
+    if precision == "bf16":
+        cast_dtype = ms.bfloat16
+    elif precision == "fp16":
+        cast_dtype = ms.float16
+    return cast_dtype
 
 
 def get_input_dtype(precision: str):
     input_dtype = None
-    if precision == "fp32":
-        input_dtype = ms.float32
-    elif precision == "fp16":
+    if precision in ("bf16", "pure_bf16"):
+        input_dtype = ms.bfloat16
+    elif precision in ("fp16", "pure_fp16"):
         input_dtype = ms.float16
     return input_dtype
 
 
-def _build_vision_tower(embed_dim: int, vision_cfg: CLIPVisionCfg, quick_gelu: bool = False):
+def _build_vision_tower(
+    embed_dim: int,
+    vision_cfg: CLIPVisionCfg,
+    quick_gelu: bool = False,
+    cast_dtype: Optional[ms.Type] = None,
+):
     if isinstance(vision_cfg, dict):
         vision_cfg = CLIPVisionCfg(**vision_cfg)
 
-    act_layer = QuickGELU if quick_gelu else nn.GELU(approximate=False)
+    act_layer = QuickGELU if quick_gelu else GELU
 
     if isinstance(vision_cfg.layers, (tuple, list)):
         vision_heads = vision_cfg.width * 32 // vision_cfg.head_width
@@ -78,6 +115,12 @@ def _build_vision_tower(embed_dim: int, vision_cfg: CLIPVisionCfg, quick_gelu: b
         )
     else:
         vision_heads = vision_cfg.width // vision_cfg.head_width
+        norm_layer = LayerNormFp32 if cast_dtype in (ms.float16, ms.bfloat16) else LayerNorm
+        if vision_cfg.norm_kwargs:
+            norm_layer = partial(norm_layer, **vision_cfg.norm_kwargs)
+        if vision_cfg.act_kwargs is not None:
+            act_layer = partial(act_layer, **vision_cfg.act_kwargs)
+
         visual = VisionTransformer(
             image_size=vision_cfg.image_size,
             patch_size=vision_cfg.patch_size,
@@ -87,14 +130,17 @@ def _build_vision_tower(embed_dim: int, vision_cfg: CLIPVisionCfg, quick_gelu: b
             mlp_ratio=vision_cfg.mlp_ratio,
             ls_init_value=vision_cfg.ls_init_value,
             patch_dropout=vision_cfg.patch_dropout,
-            input_patchnorm=vision_cfg.input_patchnorm,
-            global_average_pool=vision_cfg.global_average_pool,
             attentional_pool=vision_cfg.attentional_pool,
-            n_queries=vision_cfg.n_queries,
+            attn_pooler_queries=vision_cfg.attn_pooler_queries,
             attn_pooler_heads=vision_cfg.attn_pooler_heads,
+            pos_embed_type=vision_cfg.pos_embed_type,
+            no_ln_pre=vision_cfg.no_ln_pre,
+            final_ln_after_pool=vision_cfg.final_ln_after_pool,
+            pool_type=vision_cfg.pool_type,
             output_tokens=vision_cfg.output_tokens,
             output_dim=embed_dim,
             act_layer=act_layer,
+            norm_layer=norm_layer,
         )
 
     return visual
@@ -104,11 +150,17 @@ def _build_text_tower(
     embed_dim: int,
     text_cfg: CLIPTextCfg,
     quick_gelu: bool = False,
+    cast_dtype: Optional[ms.Type] = None,
 ):
     if isinstance(text_cfg, dict):
         text_cfg = CLIPTextCfg(**text_cfg)
 
-    act_layer = QuickGELU if quick_gelu else nn.GELU(approximate=False)
+    act_layer = QuickGELU if quick_gelu else GELU
+    norm_layer = LayerNormFp32 if cast_dtype in (ms.float16, ms.bfloat16) else LayerNorm
+    if text_cfg.norm_kwargs:
+        norm_layer = partial(norm_layer, **text_cfg.norm_kwargs)
+    if text_cfg.act_kwargs is not None:
+        act_layer = partial(act_layer, **text_cfg.act_kwargs)
 
     text = TextTransformer(
         context_length=text_cfg.context_length,
@@ -116,12 +168,17 @@ def _build_text_tower(
         width=text_cfg.width,
         heads=text_cfg.heads,
         layers=text_cfg.layers,
+        mlp_ratio=text_cfg.mlp_ratio,
         ls_init_value=text_cfg.ls_init_value,
         output_dim=embed_dim,
         embed_cls=text_cfg.embed_cls,
-        output_tokens=text_cfg.output_tokens,
+        no_causal_mask=text_cfg.no_causal_mask,
         pad_id=text_cfg.pad_id,
+        pool_type=text_cfg.pool_type,
+        proj_bias=text_cfg.proj_bias,
+        output_tokens=text_cfg.output_tokens,
         act_layer=act_layer,
+        norm_layer=norm_layer,
     )
     return text
 
@@ -135,17 +192,20 @@ class CLIP(nn.Cell):
         quick_gelu: bool = False,
         init_logit_scale: float = np.log(1 / 0.07),
         init_logit_bias: Optional[float] = None,
+        cast_dtype: Optional[ms.Type] = None,
     ):
         super().__init__()
-        self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu)
-        text = _build_text_tower(embed_dim, text_cfg, quick_gelu)
+        self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
+        text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
         self.transformer = text.transformer
         self.context_length = text.context_length
         self.vocab_size = text.vocab_size
         self.token_embedding = text.token_embedding
         self.positional_embedding = text.positional_embedding
         self.ln_final = text.ln_final
+        self.text_proj_bias = text.proj_bias
         self.text_projection = text.text_projection
+        self.text_pool_type = text.pool_type
         self.attn_mask = text.attn_mask
         self.logit_scale = Parameter(ops.ones(()) * init_logit_scale)
         if init_logit_bias is not None:
@@ -175,11 +235,27 @@ class CLIP(nn.Cell):
         x = self.transformer(x, attn_mask=self.attn_mask)
         x = x.permute((1, 0, 2))  # LND -> NLD
         x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[ops.arange(x.shape[0]), text.argmax(axis=-1)] @ self.text_projection.to(x.dtype)
+        x, _ = text_global_pool(x, text, self.text_pool_type)
+        if self.text_proj_bias:
+            x = self.text_projection(x)
+        else:
+            x = x @ self.text_projection.to(x.dtype)
         return ops.L2Normalize(-1)(x) if normalize else x
 
-    def construct(self, image: Optional[Tensor] = None, text: Optional[Tensor] = None):
+    def get_logits(self, image, text):
+        image_features = self.encode_image(image, normalize=True)
+        text_features = self.encode_text(text, normalize=True)
+        image_logits = self.logit_scale.exp() * image_features @ text_features.T
+        if self.logit_bias is not None:
+            image_logits += self.logit_bias
+        text_logits = image_logits.T
+        return image_logits, text_logits
+
+    def construct(
+        self,
+        image: Optional[Tensor] = None,
+        text: Optional[Tensor] = None,
+    ):
         image_features = self.encode_image(image, normalize=True) if image is not None else None
         text_features = self.encode_text(text, normalize=True) if text is not None else None
 
@@ -194,13 +270,14 @@ class CustomTextCLIP(nn.Cell):
         embed_dim: int,
         vision_cfg: CLIPVisionCfg,
         text_cfg: CLIPTextCfg,
+        quick_gelu: bool = False,
         init_logit_scale: float = np.log(1 / 0.07),
         init_logit_bias: Optional[float] = None,
-        quick_gelu: bool = False,
+        cast_dtype: Optional[ms.Type] = None,
     ):
         super().__init__()
-        self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu)
-        self.text = _build_text_tower(embed_dim, text_cfg, quick_gelu)
+        self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
+        self.text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
         self.context_length = self.text.context_length
         self.vocab_size = self.text.vocab_size
         self.logit_scale = Parameter(ops.ones([]) * init_logit_scale)
@@ -228,6 +305,15 @@ class CustomTextCLIP(nn.Cell):
         features = self.text(text)
         return ops.L2Normalize(-1)(features) if normalize else features
 
+    def get_logits(self, image, text):
+        image_features = self.encode_image(image, normalize=True)
+        text_features = self.encode_text(text, normalize=True)
+        image_logits = self.logit_scale.exp() * image_features @ text_features.T
+        if self.logit_bias is not None:
+            image_logits += self.logit_bias
+        text_logits = image_logits.T
+        return image_logits, text_logits
+
     def construct(
         self,
         image: Optional[Tensor] = None,
@@ -241,12 +327,32 @@ class CustomTextCLIP(nn.Cell):
         return image_features, text_features, self.logit_scale.exp()
 
 
-def convert_weights_to_lp(model: nn.Cell):
-    """Convert applicable model parameters to fp16"""
+def convert_weights_to_lp(model: nn.Cell, dtype=ms.float16):
+    """Convert applicable model parameters to low-precision (bf16 or fp16)"""
 
-    def _convert_weights(cell):
-        if isinstance(cell, (nn.Conv1d, nn.Conv2d, nn.Dense, Attention)):
-            cell.to_float(ms.float16)
+    def _convert_weights(l):  # noqa: E741
+        if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Dense)):
+            l.weight.set_dtype(dtype)
+            if l.bias is not None:
+                l.bias.set_dtype(dtype)
+
+        if isinstance(l, (MultiheadAttention, Attention)):
+            for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
+                tensor = getattr(l, attr)
+                if tensor is not None:
+                    tensor.set_dtype(dtype)
+
+        if isinstance(l, (CLIP, TextTransformer)):
+            # convert text nn.Parameter projections
+            attr = getattr(l, "text_projection", None)
+            if attr is not None:
+                attr.set_dtype(dtype)
+
+        if isinstance(l, VisionTransformer):
+            # convert vision nn.Parameter projections
+            attr = getattr(l, "proj", None)
+            if attr is not None:
+                attr.set_dtype(dtype)
 
     model.apply(_convert_weights)
 
@@ -255,59 +361,57 @@ convert_weights_to_fp16 = convert_weights_to_lp  # backwards compat
 
 
 # used to maintain checkpoint compatibility
-def convert_to_custom_text_param_dict(param_dict: dict):
-    if "text_projection" in param_dict:
-        # old format param_dict, move text tower -> .text
-        # this might happen when use ckpt from OpenAI-CLIP
-        new_param_dict = {}
-        for k, v in param_dict.items():
-            if any(
-                k.startswith(p)
-                for p in (
-                    "text_projection",
-                    "positional_embedding",
-                    "token_embedding",
-                    "transformer",
-                    "ln_final",
-                )
-            ):
+def convert_to_custom_text_state_dict(state_dict: dict):
+    if "text_projection" in state_dict:
+        # old format state_dict, move text tower -> .text
+        new_state_dict = {}
+        candidates = (
+            "text_projection",
+            "positional_embedding",
+            "token_embedding",
+            "transformer",
+            "ln_final",
+        )
+        for k, v in state_dict.items():
+            if any(k.startswith(p) for p in candidates):
                 k = "text." + k
-            new_param_dict[k] = v
-        return new_param_dict
-    return param_dict
+            new_state_dict[k] = v
+        return new_state_dict
+    return state_dict
 
 
-def build_model_from_openai_ckpt(
-    param_dict: dict,
+def build_model_from_openai_state_dict(
+    state_dict: dict,
     quick_gelu=True,
+    cast_dtype: Optional[ms.Type] = None,
 ):
-    vit = "visual.proj" in param_dict
+    vit = "visual.proj" in state_dict
 
     if vit:
-        vision_width = param_dict["visual.conv1.weight"].shape[0]
+        vision_width = state_dict["visual.conv1.weight"].shape[0]
         vision_layers = len(
-            [k for k in param_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")]
+            [k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")]
         )
-        vision_patch_size = param_dict["visual.conv1.weight"].shape[-1]
-        grid_size = round((param_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
+        vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
+        grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
         image_size = vision_patch_size * grid_size
     else:
         counts: list = [
-            len(set(k.split(".")[2] for k in param_dict if k.startswith(f"visual.layer{b}"))) for b in [1, 2, 3, 4]
+            len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in [1, 2, 3, 4]
         ]
         vision_layers = tuple(counts)
-        vision_width = param_dict["visual.layer1.0.conv1.weight"].shape[0]
-        output_width = round((param_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
+        vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
+        output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
         vision_patch_size = None
-        assert output_width**2 + 1 == param_dict["visual.attnpool.positional_embedding"].shape[0]
+        assert output_width**2 + 1 == state_dict["visual.attnpool.positional_embedding"].shape[0]
         image_size = output_width * 32
 
-    embed_dim = param_dict["text_projection"].shape[1]
-    context_length = param_dict["positional_embedding"].shape[0]
-    vocab_size = param_dict["token_embedding.embedding_table"].shape[0]
-    transformer_width = param_dict["ln_final.gamma"].shape[0]
+    embed_dim = state_dict["text_projection"].shape[1]
+    context_length = state_dict["positional_embedding"].shape[0]
+    vocab_size = state_dict["token_embedding.embedding_table"].shape[0]
+    transformer_width = state_dict["ln_final.gamma"].shape[0]
     transformer_heads = transformer_width // 64
-    transformer_layers = len(set(k.split(".")[2] for k in param_dict if k.startswith("transformer.resblocks")))
+    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
 
     vision_cfg = CLIPVisionCfg(
         layers=vision_layers,
@@ -322,24 +426,29 @@ def build_model_from_openai_ckpt(
         heads=transformer_heads,
         layers=transformer_layers,
     )
-    model = CLIP(embed_dim, vision_cfg=vision_cfg, text_cfg=text_cfg, quick_gelu=quick_gelu)
+    model = CLIP(
+        embed_dim,
+        vision_cfg=vision_cfg,
+        text_cfg=text_cfg,
+        quick_gelu=quick_gelu,
+        cast_dtype=cast_dtype,
+    )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
-        if key in param_dict:
-            del param_dict[key]
+        state_dict.pop(key, None)
 
     convert_weights_to_fp16(model)  # OpenAI state dicts are partially converted to float16
-    load_param_into_net(model, param_dict)
+    ms.load_param_into_net(model, state_dict)
     return model.set_train(False)
 
 
-def resize_pos_embed(param_dict, model, interpolation: str = "bicubic"):
-    # Rescale the grid of position embeddings when loading from param_dict
-    old_pos_embed = param_dict.get("visual.positional_embedding", None)
+def resize_pos_embed(state_dict, model, interpolation: str = "bicubic"):
+    # Rescale the grid of position embeddings when loading from state_dict
+    old_pos_embed = state_dict.get("visual.positional_embedding", None)
     if old_pos_embed is None or not hasattr(model.visual, "grid_size"):
         return
     grid_size = to_2tuple(model.visual.grid_size)
-    extra_tokens = 1  # TODO: detect different token configs (ie no class token, or more tokens)
+    extra_tokens = 1  # FIXME detect different token configs (ie no class token, or more)
     new_seq_len = grid_size[0] * grid_size[1] + extra_tokens
     if new_seq_len == old_pos_embed.shape[0]:
         return
@@ -361,14 +470,14 @@ def resize_pos_embed(param_dict, model, interpolation: str = "bicubic"):
 
     pos_emb_img = pos_emb_img.permute(0, 2, 3, 1).reshape(1, grid_size[0] * grid_size[1], -1)[0]
     if pos_emb_tok is not None:
-        new_pos_embed = ops.cat([pos_emb_tok.to(pos_emb_img.dtype), pos_emb_img], axis=0)
+        new_pos_embed = ops.cat([pos_emb_tok, pos_emb_img], axis=0)
     else:
         new_pos_embed = pos_emb_img
-    param_dict["visual.positional_embedding"] = new_pos_embed
+    state_dict["visual.positional_embedding"] = new_pos_embed
 
 
-def resize_text_pos_embed(param_dict, model, interpolation: str = "linear"):
-    old_pos_embed = param_dict.get("positional_embedding", None)
+def resize_text_pos_embed(state_dict, model, interpolation: str = "linear"):
+    old_pos_embed = state_dict.get("positional_embedding", None)
     if old_pos_embed is None:
         return
     # FIXME add support for text cls_token
@@ -395,4 +504,40 @@ def resize_text_pos_embed(param_dict, model, interpolation: str = "linear"):
     old_pos_embed = old_pos_embed.permute(0, 2, 1)[0]
     new_pos_embed = old_pos_embed
 
-    param_dict["positional_embedding"] = new_pos_embed
+    state_dict["positional_embedding"] = new_pos_embed
+
+
+def get_model_preprocess_cfg(model):
+    module = getattr(model, "visual", model)
+    preprocess_cfg = getattr(module, "preprocess_cfg", {})
+    if not preprocess_cfg:
+        # use separate legacy attributes if preprocess_cfg dict not found
+        size = getattr(module, "image_size")
+        if size is not None:
+            preprocess_cfg["size"] = size
+        mean = getattr(module, "image_mean", None)
+        if mean is not None:
+            preprocess_cfg["mean"] = mean
+        std = getattr(module, "image_std", None)
+        if std is not None:
+            preprocess_cfg["std"] = std
+    return preprocess_cfg
+
+
+def set_model_preprocess_cfg(model, preprocess_cfg: Dict[str, Any]):
+    module = getattr(model, "visual", model)
+    module.image_mean = preprocess_cfg["mean"]  # legacy attribute, keeping for bwd compat
+    module.image_std = preprocess_cfg["std"]  # legacy attribute, keeping for bwd compat
+    module.preprocess_cfg = copy.deepcopy(preprocess_cfg)  # new attr, package all pp cfg as dict
+
+
+def get_model_tokenize_cfg(model):
+    module = getattr(model, "text", model)
+    cfg = {}
+    context_length = getattr(module, "context_length", None)
+    if context_length is not None:
+        cfg["context_length"] = context_length
+    vocab_size = getattr(module, "vocab_size", None)
+    if vocab_size is not None:
+        cfg["vocab_size"] = vocab_size
+    return cfg

@@ -2,9 +2,34 @@ import mindspore as ms
 from mindspore import Tensor, nn, ops
 
 
+class AllGather(nn.Cell):
+    def __init__(self):
+        super().__init__()
+        self.all_gather = ops.AllGather()
+
+    def construct(self, x):
+        return self.all_gather(x)
+
+
+class AllGatherWithGrad(nn.Cell):
+    # https://zhuanlan.zhihu.com/p/615784842
+    # https://www.aiuai.cn/aifarm1762.html
+    def __init__(self):
+        super().__init__()
+        self.all_gather = ops.AllGather()
+        self.bprop_debug = True  # this flag makes customized bprop work
+
+    def construct(self, x):
+        return self.all_gather(x)
+
+    def bprop(self):
+        raise NotImplementedError
+
+
 def gather_features(
     image_features,
     text_features,
+    all_gather,
     local_loss=False,
     gather_with_grad=False,
     rank=0,
@@ -12,17 +37,18 @@ def gather_features(
 ):
     # We gather tensors from all ranks
     if gather_with_grad:
-        all_image_features = ops.AllGather(image_features)
-        all_text_features = ops.AllGather(text_features)
+        all_image_features = all_gather(image_features)  # w/ grad
+        all_text_features = all_gather(text_features)  # w/ grad
     else:
-        gathered_image_features = list(ops.AllGather(image_features).chunk(world_size))
-        gathered_text_features = list(ops.AllGather(text_features).chunk(world_size))
+        d = image_features.shape[1]
+        gathered_image_features = all_gather(image_features).reshape(world_size, -1, d)  # w/o grad
+        gathered_text_features = all_gather(text_features).reshape(world_size, -1, d)  # w/o grad
         if not local_loss:
             # ensure grads for local rank when all_* features don't have a gradient
             gathered_image_features[rank] = image_features
             gathered_text_features[rank] = text_features
-        all_image_features = ops.cat(gathered_image_features, axis=0)
-        all_text_features = ops.cat(gathered_text_features, axis=0)
+        all_image_features = ops.reshape(gathered_image_features, (-1, d))
+        all_text_features = ops.reshape(gathered_text_features, (-1, d))
 
     return all_image_features, all_text_features
 
@@ -42,8 +68,16 @@ class ClipLoss(nn.Cell):
         self.cache_labels = cache_labels
         self.rank = rank
         self.world_size = world_size
+        if world_size > 1:
+            if gather_with_grad:
+                self.all_gather = AllGatherWithGrad()
+            else:
+                self.all_gather = AllGather()
+        else:
+            self.all_gather = None
 
         # cache state
+        assert cache_labels is False, "Cache labels is not supported!"
         self.prev_num_logits = 0
         self.labels = {}
 
@@ -57,7 +91,13 @@ class ClipLoss(nn.Cell):
     def get_logits(self, image_features, text_features, logit_scale):
         if self.world_size > 1:
             all_image_features, all_text_features = gather_features(
-                image_features, text_features, self.local_loss, self.gather_with_grad, self.rank, self.world_size
+                image_features,
+                text_features,
+                self.all_gather,
+                self.local_loss,
+                self.gather_with_grad,
+                self.rank,
+                self.world_size,
             )
 
             if self.local_loss:
@@ -84,7 +124,7 @@ class ClipLoss(nn.Cell):
 
 class DistillClipLoss(ClipLoss):
     def dist_loss(self, teacher_logits, student_logits):
-        return -(ops.softmax(axis=1)(teacher_logits) * ops.log_softmax(axis=1)(student_logits)).sum(axis=1).mean(axis=0)
+        return -(ops.softmax(teacher_logits, axis=1) * ops.log_softmax(student_logits, axis=1)).sum(axis=1).mean(axis=0)
 
     def construct(
         self, image_features, text_features, logit_scale, dist_image_features, dist_text_features, dist_logit_scale

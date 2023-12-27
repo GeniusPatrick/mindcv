@@ -4,29 +4,21 @@ Copied from https://github.com/openai/CLIP. Originally MIT License, Copyright (c
 """
 import gzip
 import html
-
-# https://stackoverflow.com/q/62691279
 import os
-from functools import lru_cache
-from typing import List, Union
+import random
+import string
+from functools import lru_cache, partial
+from typing import Callable, List, Optional, Union
 
 import ftfy
 import numpy as np
 import regex as re
 
-import mindspore as ms
-from mindspore import Tensor, ops
-
+# https://stackoverflow.com/q/62691279
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+_nltk_init = False
 
-try:
-    import nltk
-
-    # run them for the first time
-    nltk.download("punkt")
-    nltk.download("averaged_perceptron_tagger")
-except Exception:
-    nltk = None
+DEFAULT_CONTEXT_LENGTH = 77  # default context length for OpenAI CLIP
 
 
 @lru_cache()
@@ -84,21 +76,77 @@ def whitespace_clean(text):
     return text
 
 
+def canonicalize_text(text, *, keep_punctuation_exact_string=None):
+    """Returns canonicalized `text` (lowercase and punctuation removed).
+
+    From: https://github.com/google-research/big_vision/blob/53f18caf27a9419231bbf08d3388b07671616d3d/big_vision/evaluators/proj/image_text/prompt_engineering.py#L94  # noqa: E501
+
+    Args:
+      text: string to be canonicalized.
+      keep_punctuation_exact_string: If provided, then this exact string kept.
+        For example providing '{}' will keep any occurrences of '{}' (but will
+        still remove '{' and '}' that appear separately).
+    """
+    text = text.replace("_", " ")
+    if keep_punctuation_exact_string:
+        text = keep_punctuation_exact_string.join(
+            part.translate(str.maketrans("", "", string.punctuation))
+            for part in text.split(keep_punctuation_exact_string)
+        )
+    else:
+        text = text.translate(str.maketrans("", "", string.punctuation))
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _clean_canonicalize(x):
+    # basic, remove whitespace, remove punctuation, lower case
+    return canonicalize_text(basic_clean(x))
+
+
+def _clean_lower(x):
+    # basic, remove whitespace, lower case
+    return whitespace_clean(basic_clean(x)).lower()
+
+
+def _clean_whitespace(x):
+    # basic, remove whitespace
+    return whitespace_clean(basic_clean(x))
+
+
+def get_clean_fn(type: str):
+    if type == "canonicalize":
+        return _clean_canonicalize
+    elif type == "lower":
+        return _clean_lower
+    elif type == "whitespace":
+        return _clean_whitespace
+    else:
+        assert False, f"Invalid clean function ({type})."
+
+
 class SimpleTokenizer(object):
-    def __init__(self, bpe_path: str = default_bpe(), special_tokens=None):
+    def __init__(
+        self,
+        bpe_path: str = default_bpe(),
+        additional_special_tokens: Optional[List[str]] = None,
+        context_length: Optional[int] = DEFAULT_CONTEXT_LENGTH,
+        clean: str = "lower",
+        reduction_mask: str = "",
+    ):
         self.byte_encoder = bytes_to_unicode()
         self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
         merges = gzip.open(bpe_path).read().decode("utf-8").split("\n")
         merges = merges[1 : 49152 - 256 - 2 + 1]
         merges = [tuple(merge.split()) for merge in merges]
-        vocab = list(self.byte_encoder.values())
+        vocab = list(bytes_to_unicode().values())
         vocab = vocab + [v + "</w>" for v in vocab]
         for merge in merges:
             vocab.append("".join(merge))
-        if not special_tokens:
-            special_tokens = ["<start_of_text>", "<end_of_text>"]
-        else:
-            special_tokens = ["<start_of_text>", "<end_of_text>"] + special_tokens
+        special_tokens = ["<start_of_text>", "<end_of_text>"]
+        if additional_special_tokens:
+            special_tokens += additional_special_tokens
         vocab.extend(special_tokens)
         self.encoder = dict(zip(vocab, range(len(vocab))))
         self.decoder = {v: k for k, v in self.encoder.items()}
@@ -108,9 +156,13 @@ class SimpleTokenizer(object):
         self.pat = re.compile(
             special + r"""|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+""", re.IGNORECASE
         )
-
         self.vocab_size = len(self.encoder)
         self.all_special_ids = [self.encoder[t] for t in special_tokens]
+        self.sot_token_id = self.all_special_ids[0]
+        self.eot_token_id = self.all_special_ids[1]
+        self.context_length = context_length
+        self.clean_fn = get_clean_fn(clean)
+        self.reduction_fn = get_reduction_mask_fn(reduction_mask) if reduction_mask else None
 
     def bpe(self, token):
         if token in self.cache:
@@ -155,7 +207,7 @@ class SimpleTokenizer(object):
 
     def encode(self, text):
         bpe_tokens = []
-        text = whitespace_clean(basic_clean(text)).lower()
+        text = self.clean_fn(text)
         for token in re.findall(self.pat, text):
             token = "".join(self.byte_encoder[b] for b in token.encode("utf-8"))
             bpe_tokens.extend(self.encoder[bpe_token] for bpe_token in self.bpe(token).split(" "))
@@ -166,143 +218,128 @@ class SimpleTokenizer(object):
         text = bytearray([self.byte_decoder[c] for c in text]).decode("utf-8", errors="replace").replace("</w>", " ")
         return text
 
+    def __call__(self, texts: Union[str, List[str]], context_length: Optional[int] = None) -> np.ndarray:
+        """Returns the tokenized representation of given input string(s)
+
+        Parameters
+        ----------
+        texts : Union[str, List[str]]
+            An input string or a list of input strings to tokenize
+        context_length : int
+            The context length to use; all CLIP models use 77 as the context length
+
+        Returns
+        -------
+        A two-dimensional tensor containing the resulting tokens, shape = [number of input strings, context_length]
+        """
+        if isinstance(texts, str):
+            texts = [texts]
+
+        context_length = context_length or self.context_length
+        assert context_length, "Please set a valid context length"
+
+        if self.reduction_fn is not None:
+            # use reduction strategy for tokenize if set, otherwise default to truncation below
+            return self.reduction_fn(
+                texts,
+                context_length=context_length,
+                sot_token_id=self.sot_token_id,
+                eot_token_id=self.eot_token_id,
+                encode_fn=self.encode,
+            )
+
+        all_tokens = [[self.sot_token_id] + self.encode(text) + [self.eot_token_id] for text in texts]
+        result = np.zeros((len(all_tokens), context_length), dtype=np.int64)
+
+        for i, tokens in enumerate(all_tokens):
+            if len(tokens) > context_length:
+                tokens = tokens[:context_length]  # Truncate
+                tokens[-1] = self.eot_token_id
+            result[i, : len(tokens)] = np.array(tokens)
+
+        return result
+
 
 _tokenizer = SimpleTokenizer()
 
 
-def decode(output_ids: Tensor):
-    output_ids = output_ids.asnumpy()
+def decode(output_ids: np.ndarray):
     return _tokenizer.decode(output_ids)
 
 
-def tokenize(texts: Union[str, List[str]], context_length: int = 77) -> Tensor:
-    """
-    Returns the tokenized representation of given input string(s)
+def tokenize(texts: Union[str, List[str]], context_length: int = DEFAULT_CONTEXT_LENGTH) -> np.ndarray:
+    return _tokenizer(texts, context_length=context_length)
 
-    Parameters
-    ----------
-    texts : Union[str, List[str]]
-        An input string or a list of input strings to tokenize
-    context_length : int
-        The context length to use; all CLIP models use 77 as the context length
 
-    Returns
-    -------
-    A two-dimensional tensor containing the resulting tokens, shape = [number of input strings, context_length]
-    """
-    if isinstance(texts, str):
-        texts = [texts]
-
-    sot_token = _tokenizer.encoder["<start_of_text>"]
-    eot_token = _tokenizer.encoder["<end_of_text>"]
-    all_tokens = [[sot_token] + _tokenizer.encode(text) + [eot_token] for text in texts]
-    result = ops.zeros((len(all_tokens), context_length), dtype=ms.int64)
+def random_mask_tokenize(
+    texts: Union[str, List[str]],
+    context_length: int,
+    sot_token_id: int,
+    eot_token_id: int,
+    encode_fn: Callable,
+    shuffle: bool = False,
+):
+    all_tokens = [encode_fn(text) for text in texts]
+    result = np.zeros((len(all_tokens), context_length), dtype=np.int64)
 
     for i, tokens in enumerate(all_tokens):
-        if len(tokens) > context_length:
-            tokens = tokens[:context_length]  # Truncate
-            tokens[-1] = eot_token
-        result[i, : len(tokens)] = Tensor(tokens)
-
-    return result
-
-
-def random_mask_tokenize(texts: Union[str, List[str]], context_length: int = 77) -> Tensor:
-    """
-    Returns the tokenized representation of given input string(s)
-    Parameters
-    ----------
-    texts : Union[str, List[str]]
-        An input string or a list of input strings to tokenize
-    context_length : int
-        The context length to use; all CLIP models use 77 as the context length
-    Returns
-    -------
-    A two-dimensional tensor containing the resulting tokens, shape = [number of input strings, context_length]
-    """
-    if isinstance(texts, str):
-        texts = [texts]
-
-    sot_token = _tokenizer.encoder["<start_of_text>"]
-    eot_token = _tokenizer.encoder["<end_of_text>"]
-    all_tokens = [_tokenizer.encode(text) for text in texts]
-    result = ops.zeros((len(all_tokens), context_length), dtype=ms.int64)
-
-    for i, tokens in enumerate(all_tokens):
-        if len(tokens) > context_length - 2:  # 2 for sot and eot token
-            indices = np.random.permutation(len(tokens)).tolist()
-            indices = indices[: context_length - 2]
+        tokens = np.array(tokens)
+        num_tokens = len(tokens)
+        if num_tokens > context_length - 2:  # 2 for sot and eot token
+            num_keep = context_length - 2
+            indices = np.random.permutation(len(tokens))
+            indices = indices[:num_keep]
+            if not shuffle:
+                indices = np.sort(indices, axis=0)
             tokens = tokens[indices]
-        tokens = (
-            [
-                sot_token,
-            ]
-            + tokens
-            + [
-                eot_token,
-            ]
-        )
-        result[i, : len(tokens)] = Tensor(tokens)
+            num_tokens = num_keep
+        result[i, 0] = sot_token_id
+        result[i, 1 : num_tokens + 1] = tokens
+        result[i, num_tokens + 1] = eot_token_id
 
     return result
 
 
-def block_mask_tokenize(texts: Union[str, List[str]], context_length: int = 77) -> Tensor:
-    """
-    Returns the tokenized representation of given input string(s)
-    Parameters
-    ----------
-    texts : Union[str, List[str]]
-        An input string or a list of input strings to tokenize
-    context_length : int
-        The context length to use; all CLIP models use 77 as the context length
-    Returns
-    -------
-    A two-dimensional tensor containing the resulting tokens, shape = [number of input strings, context_length]
-    """
-    if isinstance(texts, str):
-        texts = [texts]
-
-    sot_token = _tokenizer.encoder["<start_of_text>"]
-    eot_token = _tokenizer.encoder["<end_of_text>"]
-    all_tokens = [_tokenizer.encode(text) for text in texts]
-    result = ops.zeros((len(all_tokens), context_length), dtype=ms.int64)
+def simple_mask_tokenize(
+    texts: Union[str, List[str]],
+    context_length: int,
+    sot_token_id: int,
+    eot_token_id: int,
+    encode_fn: Callable,
+):
+    all_tokens = [encode_fn(text) for text in texts]
+    result = np.zeros((len(all_tokens), context_length), dtype=np.int64)
 
     for i, tokens in enumerate(all_tokens):
-        if len(tokens) > context_length - 2:  # 2 for sot and eot token
-            start_index = np.random.randint(len(tokens) - context_length + 3)
-            tokens = tokens[start_index : start_index + context_length - 2]
-        tokens = (
-            [
-                sot_token,
-            ]
-            + tokens
-            + [
-                eot_token,
-            ]
-        )
-        result[i, : len(tokens)] = Tensor(tokens)
+        num_tokens = len(tokens)
+        if num_tokens > context_length - 2:  # 2 for sot and eot token
+            num_keep = context_length - 2
+            start_index = random.randint(0, num_tokens - num_keep)  # high is incl
+            tokens = tokens[start_index : start_index + num_keep]
+        tokens = [sot_token_id] + tokens + [eot_token_id]
+        result[i, : len(tokens)] = np.array(tokens)
 
     return result
 
 
-def syntax_mask_tokenize(texts: Union[str, List[str]], context_length: int = 77) -> Tensor:
-    """
-    Returns the tokenized representation of given input string(s).
+def syntax_mask_tokenize(
+    texts: Union[str, List[str]],
+    context_length: int,
+    sot_token_id: int,
+    eot_token_id: int,
+    encode_fn: Callable,
+) -> np.ndarray:
+    """Returns the tokenized representation of given input string(s).
     Apply syntax masking before tokenize.
-    Parameters
-    ----------
-    texts : Union[str, List[str]]
-        An input string or a list of input strings to tokenize
-    context_length : int
-        The context length to use; all CLIP models use 77 as the context length
-    Returns
-    -------
-    A two-dimensional tensor containing the resulting tokens, shape = [number of input strings, context_length]
     """
-    assert nltk is not None
-    if isinstance(texts, str):
-        texts = [texts]
+    import nltk
+
+    global _nltk_init
+    if not _nltk_init:
+        # run them for the first time
+        nltk.download("punkt")
+        nltk.download("averaged_perceptron_tagger")
+        _nltk_init = True
 
     def get_order(x):
         if x.startswith("NN"):
@@ -323,8 +360,7 @@ def syntax_mask_tokenize(texts: Union[str, List[str]], context_length: int = 77)
         order_list = [get_order(tag) for _, tag in pos_tags]
         sorted_ids = np.argsort(np.array(order_list))
         sampled_ids = sorted(sorted_ids[: context_length - 2])  # need 2 slots for sot and eot tokens
-        # sample the tokens and convert to tf.tensor
-        sampled_tokens = np.take(np.array(list_tokens), sampled_ids, axis=0)
+        sampled_tokens = np.take(np.array(list_tokens), sampled_ids, axis=0)  # sample the tokens
 
         new_text = ""
         for token in sampled_tokens:
@@ -333,16 +369,27 @@ def syntax_mask_tokenize(texts: Union[str, List[str]], context_length: int = 77)
         new_texts.append(new_text)
     texts = new_texts
 
-    sot_token = _tokenizer.encoder["<start_of_text>"]
-    eot_token = _tokenizer.encoder["<end_of_text>"]
-    all_tokens = [[sot_token] + _tokenizer.encode(text) + [eot_token] for text in texts]
-    result = ops.zeros((len(all_tokens), context_length), dtype=ms.int64)
+    all_tokens = [[sot_token_id] + encode_fn(text) + [eot_token_id] for text in texts]
+    result = np.zeros((len(all_tokens), context_length), dtype=np.int64)
 
     for i, tokens in enumerate(all_tokens):
         # still need first truncate because some words produces two tokens
         if len(tokens) > context_length:
             tokens = tokens[:context_length]  # Truncate
-            tokens[-1] = eot_token
-        result[i, : len(tokens)] = Tensor(tokens)
+            tokens[-1] = eot_token_id
+        result[i, : len(tokens)] = np.array(tokens)
 
     return result
+
+
+def get_reduction_mask_fn(type: str):
+    """Choose strategy for dropping (masking) tokens to achieve target context length"""
+    assert type in ("simple", "random", "shuffle", "syntax")
+    if type == "simple":
+        return simple_mask_tokenize  # randomly select block [start:end]
+    elif type == "random":
+        return random_mask_tokenize  # randomly drop tokens (keep order)
+    elif type == "shuffle":
+        return partial(random_mask_tokenize, shuffle=True)  # randomly drop tokens (shuffle order)
+    elif type == "syntax":
+        return syntax_mask_tokenize  # randomly drop prioritized by syntax

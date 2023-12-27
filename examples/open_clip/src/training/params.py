@@ -136,6 +136,7 @@ def parse_args(args):
     parser.add_argument("--eps", type=float, default=None, help="Adam epsilon.")
     parser.add_argument("--wd", type=float, default=0.2, help="Weight decay.")
     parser.add_argument("--warmup", type=int, default=10000, help="Number of steps to warmup for.")
+    parser.add_argument("--use-bn-sync", default=False, action="store_true", help="Whether to use batch norm sync.")
     parser.add_argument(
         "--skip-scheduler",
         action="store_true",
@@ -180,6 +181,12 @@ def parse_args(args):
         choices=["O0", "O1", "O2", "O3"],
         default="O2",
         help="Optimization level of auto mixed precision (default: O2).",
+    )
+    parser.add_argument(
+        "--scaler",
+        type=str,
+        default="static@128",
+        help="Gradient scaler. 'type@value', where type must be one of static or dynamic (default: s@128)",
     )
     parser.add_argument(
         "--model",
@@ -323,7 +330,7 @@ def parse_args(args):
         "--lock-text-freeze-layer-norm",
         default=False,
         action="store_true",
-        help="Freeze BatchNorm running stats in text tower for any locked layers.",
+        help="Freeze LayerNorm running stats in text tower for any locked layers.",
     )
     parser.add_argument(
         "--log-every-n-steps",

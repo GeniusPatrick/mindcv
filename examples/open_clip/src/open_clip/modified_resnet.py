@@ -1,8 +1,9 @@
 from collections import OrderedDict
 
-import mindspore as ms
 from mindspore import Parameter, Tensor, nn, ops
-from mindspore.ops.function.nn_func import multi_head_attention_forward
+
+from .layer import multi_head_attention_forward
+from .utils import freeze_batch_norm_2d, normal_, reset_parameters_torch, zeros_
 
 
 class Bottleneck(nn.Cell):
@@ -12,36 +13,17 @@ class Bottleneck(nn.Cell):
         super().__init__()
 
         # all conv layers have stride 1. an avgpool is performed after the second convolution when stride > 1
-        self.conv1 = nn.Conv2d(
-            inplanes, planes, kernel_size=1, has_bias=False, pad_mode="pad", weight_init="uniform", bias_init="uniform"
-        )
+        self.conv1 = nn.Conv2d(inplanes, planes, 1, has_bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
         self.act1 = nn.ReLU()
 
-        self.conv2 = nn.Conv2d(
-            planes,
-            planes,
-            kernel_size=3,
-            padding=1,
-            has_bias=False,
-            pad_mode="pad",
-            weight_init="uniform",
-            bias_init="uniform",
-        )
+        self.conv2 = nn.Conv2d(planes, planes, 3, pad_mode="pad", padding=1, has_bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
         self.act2 = nn.ReLU()
 
-        self.avgpool = nn.AvgPool2d(kernel_size=stride, stride=stride, pad_mode="pad") if stride > 1 else nn.Identity()
+        self.avgpool = nn.AvgPool2d(stride, stride) if stride > 1 else nn.Identity()
 
-        self.conv3 = nn.Conv2d(
-            planes,
-            planes * self.expansion,
-            kernel_size=1,
-            has_bias=False,
-            pad_mode="pad",
-            weight_init="uniform",
-            bias_init="uniform",
-        )
+        self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, has_bias=False)
         self.bn3 = nn.BatchNorm2d(planes * self.expansion)
         self.act3 = nn.ReLU()
 
@@ -53,20 +35,8 @@ class Bottleneck(nn.Cell):
             self.downsample = nn.SequentialCell(
                 OrderedDict(
                     [
-                        ("9999", nn.AvgPool2d(kernel_size=stride, stride=stride, pad_mode="pad")),
-                        (
-                            "0",
-                            nn.Conv2d(
-                                inplanes,
-                                planes * self.expansion,
-                                1,
-                                stride=1,
-                                has_bias=False,
-                                pad_mode="pad",
-                                weight_init="uniform",
-                                bias_init="uniform",
-                            ),
-                        ),
+                        ("-1", nn.AvgPool2d(stride, stride)),
+                        ("0", nn.Conv2d(inplanes, planes * self.expansion, 1, stride=1, has_bias=False)),
                         ("1", nn.BatchNorm2d(planes * self.expansion)),
                     ]
                 )
@@ -75,10 +45,10 @@ class Bottleneck(nn.Cell):
     def construct(self, x: Tensor) -> Tensor:
         identity = x
 
-        out = self.act1(self.bn1(self.conv1(x).to(x.dtype)))
-        out = self.act2(self.bn2(self.conv2(out).to(x.dtype)))
+        out = self.act1(self.bn1(self.conv1(x)))
+        out = self.act2(self.bn2(self.conv2(out)))
         out = self.avgpool(out)
-        out = self.bn3(self.conv3(out).to(x.dtype))
+        out = self.bn3(self.conv3(out))
 
         if self.downsample is not None:
             identity = self.downsample(x)
@@ -99,11 +69,9 @@ class AttentionPool2d(nn.Cell):
         self.num_heads = num_heads
 
     def construct(self, x):
-        xtype = x.dtype
         x = x.reshape((x.shape[0], x.shape[1], x.shape[2] * x.shape[3])).permute((2, 0, 1))  # NCHW -> (HW)NC
         x = ops.cat([x.mean(axis=0, keep_dims=True), x], axis=0)  # (HW+1)NC
         x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
-        x = x.to(ms.float32)
         x, _ = multi_head_attention_forward(
             query=x,
             key=x,
@@ -123,9 +91,10 @@ class AttentionPool2d(nn.Cell):
             out_proj_bias=self.c_proj.bias,
             use_separate_proj_weight=True,
             training=self.training,
+            need_weights=False,
         )
 
-        return x[0].to(xtype)
+        return x[0]
 
 
 class ModifiedResNet(nn.Cell):
@@ -142,22 +111,16 @@ class ModifiedResNet(nn.Cell):
         self.image_size = image_size
 
         # the 3-layer stem
-        self.conv1 = nn.Conv2d(
-            3, width // 2, kernel_size=3, stride=2, padding=1, has_bias=False, pad_mode="pad", weight_init="HeUniform"
-        )
+        self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, pad_mode="pad", padding=1, has_bias=False)
         self.bn1 = nn.BatchNorm2d(width // 2)
         self.act1 = nn.ReLU()
-        self.conv2 = nn.Conv2d(
-            width // 2, width // 2, kernel_size=3, padding=1, has_bias=False, pad_mode="pad", weight_init="HeUniform"
-        )
+        self.conv2 = nn.Conv2d(width // 2, width // 2, kernel_size=3, pad_mode="pad", padding=1, has_bias=False)
         self.bn2 = nn.BatchNorm2d(width // 2)
         self.act2 = nn.ReLU()
-        self.conv3 = nn.Conv2d(
-            width // 2, width, kernel_size=3, padding=1, has_bias=False, pad_mode="pad", weight_init="HeUniform"
-        )
+        self.conv3 = nn.Conv2d(width // 2, width, kernel_size=3, pad_mode="pad", padding=1, has_bias=False)
         self.bn3 = nn.BatchNorm2d(width)
         self.act3 = nn.ReLU()
-        self.avgpool = nn.AvgPool2d(kernel_size=2, stride=2, pad_mode="pad")
+        self.avgpool = nn.AvgPool2d(2, 2)
 
         # residual layers
         self._inplanes = width  # this is a *mutable* variable used during construction
@@ -169,6 +132,7 @@ class ModifiedResNet(nn.Cell):
         embed_dim = width * 32  # the ResNet feature dimension
         self.attnpool = AttentionPool2d(image_size // 32, embed_dim, heads, output_dim)
 
+        self.apply(reset_parameters_torch)
         self.init_parameters()
 
     def _make_layer(self, planes, blocks, stride=1):
@@ -183,31 +147,31 @@ class ModifiedResNet(nn.Cell):
     def init_parameters(self):
         if self.attnpool is not None:
             std = self.attnpool.c_proj.in_channels**-0.5
-            self.attnpool.q_proj.weight.set_data(ops.normal(self.attnpool.q_proj.weight.shape, stddev=std, mean=0))
-            self.attnpool.k_proj.weight.set_data(ops.normal(self.attnpool.k_proj.weight.shape, stddev=std, mean=0))
-            self.attnpool.v_proj.weight.set_data(ops.normal(self.attnpool.v_proj.weight.shape, stddev=std, mean=0))
-            self.attnpool.c_proj.weight.set_data(ops.normal(self.attnpool.c_proj.weight.shape, stddev=std, mean=0))
+            normal_(self.attnpool.q_proj.weight, std=std)
+            normal_(self.attnpool.k_proj.weight, std=std)
+            normal_(self.attnpool.v_proj.weight, std=std)
+            normal_(self.attnpool.c_proj.weight, std=std)
 
         for resnet_block in [self.layer1, self.layer2, self.layer3, self.layer4]:
-            for param in resnet_block.get_parameters():
-                if param.name.endswith("bn3.weight"):
-                    param.set_data(ops.zeros(param.shape))
+            for name, param in resnet_block.parameters_and_names():
+                if name.endswith("bn3.weight"):
+                    zeros_(param)
 
     def lock(self, unlocked_groups=0, freeze_bn_stats=False):
         assert unlocked_groups == 0, "partial locking not currently supported for this model"
         for param in self.get_parameters():
             param.requires_grad = False
-        # freeze_batch_norm_2d realize the same operation as the above
-        # "requires_grad = False" to nn.BatchNorm2d and nn.SyncBatchNorm
+        if freeze_bn_stats:
+            freeze_batch_norm_2d(self)
 
     def set_grad_checkpointing(self, enable=True):
         # FIXME support for non-transformer
         pass
 
     def stem(self, x):
-        x = self.act1(self.bn1(self.conv1(x).to(x.dtype)))
-        x = self.act2(self.bn2(self.conv2(x).to(x.dtype)))
-        x = self.act3(self.bn3(self.conv3(x).to(x.dtype)))
+        x = self.act1(self.bn1(self.conv1(x)))
+        x = self.act2(self.bn2(self.conv2(x)))
+        x = self.act3(self.bn3(self.conv3(x)))
         x = self.avgpool(x)
         return x
 
